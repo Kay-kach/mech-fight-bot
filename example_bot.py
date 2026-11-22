@@ -100,7 +100,7 @@ class ArenaMap:
 
 
 class Bot:
-    name = "survival-tactician-v13"
+    name = "survival-tactician-v14"
 
     def __init__(self, hello: mf.Hello):
         self.slot = int(hello.get("slot", 0))
@@ -135,6 +135,10 @@ class Bot:
         self.locked_target_id: int | None = None
         self.locked_target_h: float = 4.5
         self.lock_lost_tick: int = -999
+
+        # Cover memory: last known good cover positions
+        self.cover_pos: list[float] | None = None
+        self.cover_tick: int = -999
 
     def act(self, obs: mf.Observation) -> mf.Action:
         try:
@@ -177,9 +181,7 @@ class Bot:
                 return 0.2
             if rushed:
                 return 0.1
-            if target_hp < 100.0:
-                return 0.5
-            return 1.0  # laser telegraphs; avoid in duels
+            return 0.5  # laser telegraphs position; avoid
 
         if wk == "gun":
             if dist > self.gun_range:
@@ -187,26 +189,24 @@ class Bot:
             if float(w.get("reload", 0.0)) > 0.15:
                 return 0.1
             if target_hp < 150.0 and int(w.get("ammo", 12)) > 0:
-                return 9.0
-            return 7.0
+                return 10.0
+            return 8.0
 
         if wk == "lightning":
             if dist > self.lightning_range or energy < 18.0:
                 return -1.0
             if target_hp < 150.0:
-                return 8.0
-            if "laser" in enemy_weapons:
-                return 2.0
+                return 7.0
             return 1.0
 
         if wk == "mortar":
-            if dist < 70.0 or dist > self.mortar_range:
+            if dist < 80.0 or dist > self.mortar_range:
                 return -1.0
             if float(w.get("cooldown", 0.0)) > 0.25:
                 return 0.2
             if rushed:
                 return 0.1
-            return 1.5
+            return 1.0
 
         return 0.0
 
@@ -269,14 +269,12 @@ class Bot:
         return [yaw, clamp(pitch, -1.3, 1.3)]
 
     def _dodge_vector(self, x: float, y: float, projectiles: list) -> tuple[float, float]:
-        """Compute movement vector to dodge incoming projectiles."""
         dodge_vx, dodge_vy = 0.0, 0.0
         for p in projectiles:
             px, py = p["pos"][0], p["pos"][1]
             pvx, pvy = p.get("vel", [0.0, 0.0])[0], p.get("vel", [0.0, 0.0])[1]
             d = math.hypot(px - x, py - y)
-            if d < 60.0 and d > 2.0:
-                # Projectile heading toward us? Check if velocity points roughly at us
+            if d < 50.0 and d > 2.0:
                 to_me_x, to_me_y = x - px, y - py
                 to_me_dist = math.hypot(to_me_x, to_me_y)
                 if to_me_dist > 0.01:
@@ -285,18 +283,43 @@ class Bot:
                     vel_dist = math.hypot(pvx, pvy)
                     if vel_dist > 0.01:
                         align = (pvx / vel_dist) * to_me_x + (pvy / vel_dist) * to_me_y
-                        if align > 0.3:  # heading toward us
-                            # Perpendicular dodge direction
+                        if align > 0.25:
                             perp_x, perp_y = -to_me_y, to_me_x
-                            # Pick direction with better clearance
                             clear1 = self.arena.path_clearance(x, y, math.atan2(perp_y, perp_x))
                             clear2 = self.arena.path_clearance(x, y, math.atan2(-perp_y, -perp_x))
                             if clear2 > clear1:
                                 perp_x, perp_y = -perp_x, -perp_y
-                            speed_factor = max(0.0, (60.0 - d) / 60.0)
-                            dodge_vx += perp_x * 2.5 * speed_factor
-                            dodge_vy += perp_y * 2.5 * speed_factor
+                            speed_factor = max(0.0, (50.0 - d) / 50.0)
+                            dodge_vx += perp_x * 2.8 * speed_factor
+                            dodge_vy += perp_y * 2.8 * speed_factor
         return dodge_vx, dodge_vy
+
+    def _find_cover(self, x: float, y: float, enemies: list, max_dist: float = 40.0) -> tuple[float, float] | None:
+        """Find a nearby blocked cell that breaks LOS to enemies."""
+        best = None
+        best_score = -999.0
+        # Search in a spiral around current position
+        for r in range(4, int(max_dist) + 1, 4):
+            for ang_deg in range(0, 360, 15):
+                ang = math.radians(ang_deg)
+                cx = x + math.cos(ang) * r
+                cy = y + math.sin(ang) * r
+                if not self.arena.is_blocked(cx, cy):
+                    continue
+                # Score: distance from enemies, breaks LOS to primary
+                score = -r  # prefer closer cover
+                for e in enemies:
+                    ex, ey = e["pos"][0], e["pos"][1]
+                    ed = math.hypot(ex - cx, ey - cy)
+                    score += min(ed, 30.0) * 0.1  # cover far from enemies is better
+                    # Bonus if cover is between us and enemy
+                    mx, my = (x + cx) / 2, (y + cy) / 2
+                    if self.arena.is_blocked(mx, my):
+                        score += 5.0
+                if score > best_score:
+                    best_score = score
+                    best = (cx, cy)
+        return best
 
     def _act(self, obs: mf.Observation) -> mf.Action:
         tick = int(obs["tick"])
@@ -356,7 +379,7 @@ class Bot:
                 self.last_known_pos.pop(mid, None)
                 self.prev_enemy_vel.pop(mid, None)
 
-        # 4. Weapon loot pickup
+        # 4. Weapon loot pickup (gun only preference, never swap during combat)
         in_combat = len(enemy_mechs) > 0
         for p in obs.get("pickups", []):
             if math.dist(p["pos"][:2], (x, y)) < self.reach and abs(p["pos"][2] - z) < 4.0:
@@ -364,17 +387,13 @@ class Bot:
                 if pk in held_kinds:
                     continue
                 empty = any(w is None for w in weapons)
+                if empty and pk == "gun" and weapons[0] is not None and weapons[0]["kind"] != "gun":
+                    act["take"] = p["id"]
+                    act["drop"] = 1
+                    break
                 if empty:
                     act["take"] = p["id"]
                     break
-                if not in_combat and not is_charging_laser:
-                    candidates = sorted(
-                        (self._pickup_value(w["kind"]), si) for si, w in enumerate(weapons) if w is not None
-                    )
-                    if candidates and self._pickup_value(pk) > candidates[0][0] + 0.4:
-                        act["take"] = p["id"]
-                        act["drop"] = candidates[0][1]
-                        break
 
         # 5. Threat assessment
         nearby_enemies = [m for m in enemy_mechs if math.dist(me["pos"], m["pos"]) < 130.0]
@@ -391,7 +410,7 @@ class Bot:
 
         rushed = len(nearby_enemies) >= 2
 
-        # 6. Movement
+        # 6. Movement - COVER-CENTRIC TURTLE
         vx_des, vy_des = 0.0, 0.0
         z_cur = obs["zone"]
         nx, ny = z_cur["next_center"]
@@ -405,75 +424,97 @@ class Bot:
             vx_des += math.cos(az) * w_zone
             vy_des += math.sin(az) * w_zone
 
-        # Projectile dodging (highest priority when projectiles nearby)
+        # Projectile dodging (highest priority)
         dodge_vx, dodge_vy = self._dodge_vector(x, y, obs.get("projectiles", []))
         dodging = math.hypot(dodge_vx, dodge_vy) > 0.1
 
         if must_retreat := (
             len(nearby_enemies) >= 2
-            or (len(nearby_enemies) >= 1 and hp_frac < 0.40)
-            or (primary is not None and d_primary < 70.0 and hp_frac < 0.65)
+            or (len(nearby_enemies) >= 1 and hp_frac < 0.50)
+            or (primary is not None and d_primary < 80.0 and hp_frac < 0.70)
         ):
-            # Retreat away from all nearby enemies
+            # Retreat to cover, away from enemies
             for e in nearby_enemies:
                 ex, ey = e["pos"][0], e["pos"][1]
                 d = math.hypot(ex - x, ey - y)
                 w = 1.0 + max(0.0, (130.0 - d) / 130.0)
                 ang_away = math.atan2(y - ey, x - ex)
-                vx_des += math.cos(ang_away) * w * 2.8
-                vy_des += math.sin(ang_away) * w * 2.8
+                vx_des += math.cos(ang_away) * w * 3.0
+                vy_des += math.sin(ang_away) * w * 3.0
+
             # Seek cover
-            best_cover_ang = None
-            best_cover_score = -999.0
-            for k in range(8):
-                ca = (tick * 0.08 + k) * (math.pi / 4.0)
-                cx, cy = x + math.cos(ca) * 18.0, y + math.sin(ca) * 18.0
-                if self.arena.is_blocked(cx, cy):
-                    score = 2.0
-                    if primary is not None:
-                        mx, my = (x + cx) / 2, (y + cy) / 2
-                        if self.arena.is_blocked(mx, my):
-                            score += 3.0
-                    if score > best_cover_score:
-                        best_cover_score = score
-                        best_cover_ang = ca
-            if best_cover_ang is not None:
-                vx_des += math.cos(best_cover_ang) * 2.2
-                vy_des += math.sin(best_cover_ang) * 2.2
+            cover = self._find_cover(x, y, nearby_enemies, 50.0)
+            if cover:
+                cx, cy = cover
+                ac = math.atan2(cy - y, cx - x)
+                vx_des += math.cos(ac) * 2.5
+                vy_des += math.sin(ac) * 2.5
+                self.cover_pos = cover
+                self.cover_tick = tick
         elif dodging:
-            # Dodging takes priority over engagement
             vx_des += dodge_vx
             vy_des += dodge_vy
+            # After dodging, seek cover
+            cover = self._find_cover(x, y, nearby_enemies, 50.0)
+            if cover:
+                cx, cy = cover
+                ac = math.atan2(cy - y, cx - x)
+                vx_des += math.cos(ac) * 1.5
+                vy_des += math.sin(ac) * 1.5
         elif primary is not None:
-            # 1v1: close to point-blank, strafe, shoot
+            # Turtle: stay behind cover, only engage at point-blank from cover
             ex, ey = primary["pos"][0], primary["pos"][1]
             d = math.hypot(ex - x, ey - y)
             ang_toward = math.atan2(ey - y, ex - x)
             ang_away = math.atan2(y - ey, x - ex)
 
-            ideal_dist = 25.0  # point-blank where spread doesn't matter
+            # Check if we have cover between us and enemy
+            mx, my = (x + ex) / 2, (y + ey) / 2
+            has_cover = self.arena.is_blocked(mx, my)
 
-            if d < ideal_dist * 0.5:
-                vx_des += math.cos(ang_away) * 1.0
-                vy_des += math.sin(ang_away) * 1.0
-            elif d > ideal_dist * 1.4:
-                vx_des += math.cos(ang_toward) * 2.4
-                vy_des += math.sin(ang_toward) * 2.4
-            else:
+            if d < 25.0:
+                # Point-blank: strafe and shoot
                 s_ang = ang_toward + (math.pi * 0.5) * self.strafe_dir
-                vx_des += math.cos(s_ang) * 1.8
-                vy_des += math.sin(s_ang) * 1.8
+                vx_des += math.cos(s_ang) * 1.5
+                vy_des += math.sin(s_ang) * 1.5
+            elif d < 60.0 and has_cover:
+                # Behind cover, enemy close: peek and shoot
+                s_ang = ang_toward + (math.pi * 0.5) * self.strafe_dir
+                vx_des += math.cos(s_ang) * 0.8
+                vy_des += math.sin(s_ang) * 0.8
+            elif d < 100.0 and not has_cover:
+                # No cover, enemy at mid range: retreat to cover
+                cover = self._find_cover(x, y, nearby_enemies, 60.0)
+                if cover:
+                    cx, cy = cover
+                    ac = math.atan2(cy - y, cx - x)
+                    vx_des += math.cos(ac) * 2.2
+                    vy_des += math.sin(ac) * 2.2
+                else:
+                    vx_des += math.cos(ang_away) * 2.0
+                    vy_des += math.sin(ang_away) * 2.0
+            else:
+                # Enemy far: move toward cover
+                cover = self._find_cover(x, y, nearby_enemies, 50.0)
+                if cover:
+                    cx, cy = cover
+                    ac = math.atan2(cy - y, cx - x)
+                    vx_des += math.cos(ac) * 1.8
+                    vy_des += math.sin(ac) * 1.8
+                else:
+                    vx_des += math.cos(ang_toward) * 1.0
+                    vy_des += math.sin(ang_toward) * 1.0
 
-        # NPC farming only when safe
+        # NPC farming only when completely safe
         if not must_retreat and not dodging and not enemy_mechs:
             if npcs:
                 n = npcs[0]
                 nd = math.dist(n["pos"], me["pos"])
-                if nd < 55.0:
+                if nd < 45.0:
                     nx_, ny_ = n["pos"][0], n["pos"][1]
                     ang = math.atan2(ny_ - y, nx_ - x)
-                    vx_des += math.cos(ang) * 1.6
-                    vy_des += math.sin(ang) * 1.6
+                    vx_des += math.cos(ang) * 1.4
+                    vy_des += math.sin(ang) * 1.4
 
         for snd in obs.get("sounds", []):
             if snd.get("dist") == "near" and snd.get("kind") in ("gun", "laser", "mortar", "lightning", "explosion"):
@@ -540,6 +581,7 @@ class Bot:
         act["jump"] = bool(must_retreat and me.get("grounded", False) and tick % 28 == 0 and energy > 35.0)
 
         # 7. Target selection & firing
+        # Only fire at house bots at point-blank or from cover; never telegraph
         muzzle_h = float(me.get("stats", {}).get("muzzle_height", self.cfg.get("mech", {}).get("muzzle_height", 7.0)))
         my_aim = me.get("aim") or [0.0, 0.0]
         has_pitch = len(my_aim) > 1
@@ -600,18 +642,24 @@ class Bot:
                 self.locked_target_id = None
                 self.lock_lost_tick = -999
 
-                # Target priority: house bots with HP advantage first, then NPCs
-                if enemy_mechs and hp_frac > 0.75 and len(nearby_enemies) <= 1:
-                    target = primary
-                    target_h = 4.5
+                # Only engage house bots at point-blank or from cover
+                if enemy_mechs and hp_frac > 0.70 and len(nearby_enemies) <= 1:
+                    if d_primary < 35.0:
+                        target = primary
+                        target_h = 4.5
+                    elif d_primary < 70.0:
+                        mx, my = (x + primary["pos"][0]) / 2, (y + primary["pos"][1]) / 2
+                        if self.arena.is_blocked(mx, my):
+                            target = primary
+                            target_h = 4.5
                 elif npcs and hp_frac > 0.70:
                     n = npcs[0]
-                    if math.dist(n["pos"], me["pos"]) < 55.0:
+                    if math.dist(n["pos"], me["pos"]) < 45.0:
                         target = n
                         target_h = 1.75
                 elif obs.get("crates") and hp_frac > 0.70:
                     cr = min(obs["crates"], key=lambda c: math.dist(c["pos"], me["pos"]))
-                    if math.dist(cr["pos"], me["pos"]) < 35.0:
+                    if math.dist(cr["pos"], me["pos"]) < 30.0:
                         target = cr
                         target_h = 1.2
 
@@ -663,7 +711,7 @@ class Bot:
                         if on_target:
                             fire[best_slot] = True
                     elif pk == "mortar":
-                        if 70.0 <= dist_t <= self.mortar_range and on_target:
+                        if 80.0 <= dist_t <= self.mortar_range and on_target:
                             fire[best_slot] = True
                     elif pk == "lightning":
                         if dist_t <= self.lightning_range and energy >= 18.0 and on_target:
@@ -682,7 +730,7 @@ class Bot:
                         else:
                             fire[best_slot] = True
 
-                    # Secondary weapon, independent aim
+                    # Secondary weapon
                     other_slot = 1 - best_slot
                     ow = weapons[other_slot]
                     if ow is not None and pk != "mortar" and ow["kind"] != "mortar":
@@ -718,7 +766,6 @@ class Bot:
             else:
                 self.locked_target_id = None
                 self.lock_lost_tick = -999
-                # Don't scan/telegraph at house bots
                 if not enemy_mechs:
                     scan_yaw = (tick * 0.14) % (2.0 * math.pi) - math.pi
                     act["aim"] = [scan_yaw, 0.0]
