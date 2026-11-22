@@ -69,7 +69,7 @@ class ArenaMap:
 
 
 class Bot:
-    name = "survival-tactician-v17"
+    name = "survival-tactician-v18"
 
     def __init__(self, hello):
         self.cfg = hello.get("config", {})
@@ -107,7 +107,6 @@ class Bot:
         if obs.get("offer"):
             act["pick"] = 0
 
-        # Track enemy positions for lead
         enemies = sorted((m for m in obs.get("mechs", []) if m.get("kind") == "mech"),
                          key=lambda m: math.dist(m["pos"], me["pos"]))
         npcs = sorted((m for m in obs.get("mechs", []) if m.get("kind") == "npc"),
@@ -134,7 +133,6 @@ class Bot:
                     act["take"] = p["id"]
                     break
 
-        # Movement: zone + strafe + dodge projectiles
         vx, vy = 0.0, 0.0
         zone = obs["zone"]
         nc, nr = zone["next_center"], float(zone["next_radius"])
@@ -145,12 +143,12 @@ class Bot:
             vx += math.cos(az) * 2.5
             vy += math.sin(az) * 2.5
 
-        # Dodge incoming projectiles
+        # Dodge projectiles
         for pj in obs.get("projectiles", []):
             px, py = pj["pos"][0], pj["pos"][1]
             pvx, pvy = pj.get("vel", [0, 0, 0])[0], pj.get("vel", [0, 0, 0])[1]
             d = math.hypot(px - x, py - y)
-            if 2.0 < d < 35.0:
+            if 2.0 < d < 30.0:
                 tx, ty = x - px, y - py
                 td = math.hypot(tx, ty)
                 if td > 0.01:
@@ -163,7 +161,7 @@ class Bot:
                             px2, py2 = -ty, tx
                             if self.arena.blocked_at(x + px2, y + py2):
                                 px2, py2 = -px2, -py2
-                            sf = max(0.0, (35.0 - d) / 35.0)
+                            sf = max(0.0, (30.0 - d) / 30.0)
                             vx += px2 * 2.5 * sf
                             vy += py2 * 2.5 * sf
 
@@ -172,17 +170,43 @@ class Bot:
             ex, ey = e["pos"][0], e["pos"][1]
             d = math.hypot(ex - x, ey - y)
             at = math.atan2(ey - y, ex - x)
-            # Aggressive: close to 25m, then strafe
-            if d > 30.0:
-                vx += math.cos(at) * 2.0
-                vy += math.sin(at) * 2.0
-            else:
+
+            # Pure turtle: never approach at long range.
+            # Only close to point-blank (< 15m). Otherwise retreat to cover.
+            if d < 15.0:
+                # Point-blank: strafe to be harder to hit (enemy has perfect aim,
+                # but fast strafe breaks their aim slew at close range)
                 sa = at + (math.pi * 0.5) * self.strafe_dir
                 vx += math.cos(sa) * 1.5
                 vy += math.sin(sa) * 1.5
+            else:
+                # Retreat: move away from enemy, seek cover
+                aa = math.atan2(y - ey, x - ex)
+                vx += math.cos(aa) * 2.2
+                vy += math.sin(aa) * 2.2
+                # Seek cover: move toward a blocked cell
+                best_cx, best_cy, best_s = x, y, -999.0
+                for k in range(8):
+                    ca = (t * 0.05 + k) * (math.pi / 4.0)
+                    cx, cy = x + math.cos(ca) * 20.0, y + math.sin(ca) * 20.0
+                    if self.arena.blocked_at(cx, cy):
+                        # Bonus if cover breaks LOS to enemy
+                        mx, my = (x + cx) / 2, (y + cy) / 2
+                        score = 1.0
+                        if self.arena.blocked_at(mx, my):
+                            score += 3.0
+                        # Closer cover is better
+                        score -= math.hypot(cx - x, cy - y) * 0.05
+                        if score > best_s:
+                            best_s = score
+                            best_cx, best_cy = cx, cy
+                if best_s > 0:
+                    ac = math.atan2(best_cy - y, best_cx - x)
+                    vx += math.cos(ac) * 1.8
+                    vy += math.sin(ac) * 1.8
         else:
-            vx += math.cos(t * 0.1) * 0.5
-            vy += math.sin(t * 0.1) * 0.5
+            vx += math.cos(t * 0.1) * 0.4
+            vy += math.sin(t * 0.1) * 0.4
 
         if math.hypot(vx, vy) < 0.05:
             vx = math.cos(t * 0.13) * 0.4
@@ -204,7 +228,6 @@ class Bot:
         act["boost"] = bool(enemies and eng > 25.0)
         act["jump"] = bool(False)
 
-        # Fire at nearest enemy if in range and on target
         fire = [False, False]
         aim = None
         if enemies:
@@ -215,43 +238,44 @@ class Bot:
             dt = math.dist(tpos, me["pos"])
             thp = float(e.get("hp", 1400.0))
 
-            best_slot, best_u = None, -1.0
-            for i, w in enumerate(wpn):
-                if w is None:
-                    continue
-                wk = w["kind"]
-                if wk == "gun" and dt <= self.gun_range:
-                    u = 8.0 if thp < 150 else (6.0 if dt < 50 else 2.0)
-                elif wk == "lightning" and dt <= self.lightning_range and eng >= 18:
-                    u = 7.0 if thp < 150 else 1.0
-                elif wk == "laser":
-                    u = 2.0 if dt <= 280 else -1.0
-                elif wk == "mortar":
-                    u = 1.0 if 60 <= dt <= 225 else -1.0
-                else:
-                    continue
-                if u > best_u:
-                    best_u = u
-                    best_slot = i
-
-            if best_slot is not None:
-                w = wpn[best_slot]
-                mh = float(me.get("stats", {}).get("muzzle_height", 7.0))
-                aim = self._aim(me, mh, tpos, tvel, wk, w.get("stats", {}))
-                act["aim"] = aim
-                ye = abs((aim[0] - float(me.get("aim", [0, 0])[0]) + math.pi) % (2 * math.pi) - math.pi)
-                if wk == "gun" and ye < 0.25:
-                    fire[best_slot] = True
-                elif wk == "lightning" and dt <= self.lightning_range and eng >= 18 and ye < 0.4:
-                    fire[best_slot] = True
-                elif wk == "laser":
-                    chg = float(w.get("charge", 0.0))
-                    if chg > 0.5 and ye < 0.1:
-                        fire[best_slot] = False
+            # Only fire at point-blank range
+            if dt < 20.0:
+                best_slot, best_u = None, -1.0
+                for i, w in enumerate(wpn):
+                    if w is None:
+                        continue
+                    wk = w["kind"]
+                    if wk == "gun" and dt <= self.gun_range:
+                        u = 10.0 if thp < 150 else 8.0
+                    elif wk == "lightning" and dt <= self.lightning_range and eng >= 18:
+                        u = 9.0 if thp < 150 else 1.0
+                    elif wk == "laser":
+                        u = 2.0 if dt <= 280 else -1.0
+                    elif wk == "mortar":
+                        u = -1.0  # mortar useless at point-blank
                     else:
+                        continue
+                    if u > best_u:
+                        best_u = u
+                        best_slot = i
+
+                if best_slot is not None:
+                    w = wpn[best_slot]
+                    mh = float(me.get("stats", {}).get("muzzle_height", 7.0))
+                    aim = self._aim(me, mh, tpos, tvel, wk, w.get("stats", {}))
+                    act["aim"] = aim
+                    my_aim = me.get("aim", [0, 0])
+                    ye = abs((aim[0] - float(my_aim[0]) + math.pi) % (2 * math.pi) - math.pi)
+                    if wk == "gun" and ye < 0.25:
                         fire[best_slot] = True
-                elif wk == "mortar" and ye < 0.25:
-                    fire[best_slot] = True
+                    elif wk == "lightning" and dt <= self.lightning_range and eng >= 18 and ye < 0.4:
+                        fire[best_slot] = True
+                    elif wk == "laser":
+                        chg = float(w.get("charge", 0.0))
+                        if chg > 0.5 and ye < 0.1:
+                            fire[best_slot] = False
+                        else:
+                            fire[best_slot] = True
 
         if aim is None:
             act["aim"] = [(t * 0.12) % (2 * math.pi) - math.pi, 0.0]
