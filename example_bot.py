@@ -100,7 +100,7 @@ class ArenaMap:
 
 
 class Bot:
-    name = "survival-tactician-v11"
+    name = "survival-tactician-v12"
 
     def __init__(self, hello: mf.Hello):
         self.slot = int(hello.get("slot", 0))
@@ -176,10 +176,10 @@ class Bot:
             if float(w.get("cooldown", 0.0)) > 0.25:
                 return 0.2
             if rushed:
-                return 0.2
+                return 0.1  # never charge while being rushed
             if target_hp < 100.0:
-                return 1.0  # gun/lightning finish faster
-            return 2.0  # laser telegraphs too much in a duel
+                return 0.5
+            return 1.0  # laser telegraphs too much; avoid in duels
 
         if wk == "gun":
             if dist > self.gun_range:
@@ -187,26 +187,26 @@ class Bot:
             if float(w.get("reload", 0.0)) > 0.15:
                 return 0.1
             if target_hp < 150.0 and int(w.get("ammo", 12)) > 0:
-                return 7.0
-            return 5.0
+                return 8.0
+            return 6.0
 
         if wk == "lightning":
             if dist > self.lightning_range or energy < 18.0:
                 return -1.0
             if target_hp < 150.0:
-                return 6.5
+                return 7.0
             if "laser" in enemy_weapons:
-                return 2.5
-            return 1.5
+                return 2.0
+            return 1.0
 
         if wk == "mortar":
-            if dist < 60.0 or dist > self.mortar_range:
+            if dist < 70.0 or dist > self.mortar_range:
                 return -1.0
             if float(w.get("cooldown", 0.0)) > 0.25:
                 return 0.2
             if rushed:
-                return 0.2
-            return 2.0
+                return 0.1
+            return 1.5
 
         return 0.0
 
@@ -361,13 +361,7 @@ class Bot:
 
         rushed = len(nearby_enemies) >= 2
 
-        # Retreat only when outnumbered or critically low HP
-        must_retreat = (
-            len(nearby_enemies) >= 2
-            or (len(nearby_enemies) >= 1 and hp_frac < 0.30)
-        )
-
-        # 6. Desired movement vector
+        # 6. Movement strategy
         vx_des, vy_des = 0.0, 0.0
         z_cur = obs["zone"]
         nx, ny = z_cur["next_center"]
@@ -381,96 +375,93 @@ class Bot:
             vx_des += math.cos(az) * w_zone
             vy_des += math.sin(az) * w_zone
 
-        if must_retreat:
+        # Early/mid game: avoid house bots, farm NPCs
+        # Only engage house bots when we have HP advantage and it's 1v1
+        can_fight_house = (
+            hp_frac > 0.80
+            and len(nearby_enemies) <= 1
+            and cubes >= 3  # have some HP upgrades
+        )
+
+        if must_retreat := (
+            len(nearby_enemies) >= 2
+            or (len(nearby_enemies) >= 1 and hp_frac < 0.55)
+            or (primary is not None and d_primary < 60.0 and hp_frac < 0.75)
+        ):
+            # Retreat away from all nearby enemies
             for e in nearby_enemies:
                 ex, ey = e["pos"][0], e["pos"][1]
                 d = math.hypot(ex - x, ey - y)
                 w = 1.0 + max(0.0, (130.0 - d) / 130.0)
                 ang_away = math.atan2(y - ey, x - ex)
-                vx_des += math.cos(ang_away) * w * 2.4
-                vy_des += math.sin(ang_away) * w * 2.4
-            # seek cover: move toward a blocked cell
+                vx_des += math.cos(ang_away) * w * 2.6
+                vy_des += math.sin(ang_away) * w * 2.6
+            # Seek cover
             best_cover_ang = None
             best_cover_score = -999.0
             for k in range(8):
                 ca = (tick * 0.08 + k) * (math.pi / 4.0)
-                cx, cy = x + math.cos(ca) * 16.0, y + math.sin(ca) * 16.0
+                cx, cy = x + math.cos(ca) * 18.0, y + math.sin(ca) * 18.0
                 if self.arena.is_blocked(cx, cy):
-                    score = 1.5
+                    score = 2.0
                     if primary is not None:
                         mx, my = (x + cx) / 2, (y + cy) / 2
                         if self.arena.is_blocked(mx, my):
-                            score += 2.0
+                            score += 3.0
                     if score > best_cover_score:
                         best_cover_score = score
                         best_cover_ang = ca
             if best_cover_ang is not None:
-                vx_des += math.cos(best_cover_ang) * 1.8
-                vy_des += math.sin(best_cover_ang) * 1.8
-        elif primary is not None:
-            # 1v1: close-range duel. If damaged and enemy is far, retreat to cover & heal.
-            # Otherwise rush to kill range and strafe.
+                vx_des += math.cos(best_cover_ang) * 2.0
+                vy_des += math.sin(best_cover_ang) * 2.0
+        elif not can_fight_house and enemy_mechs:
+            # Avoid house bots - keep distance, don't engage
             ex, ey = primary["pos"][0], primary["pos"][1]
             d = math.hypot(ex - x, ey - y)
-            e_hp_frac = float(primary.get("hp", 1400.0)) / max(float(primary.get("max_hp", 1400.0)), 1.0)
+            ang_away = math.atan2(y - ey, x - ex)
+            if d < 90.0:
+                vx_des += math.cos(ang_away) * 2.0
+                vy_des += math.sin(ang_away) * 2.0
+            elif d < 130.0:
+                s_ang = ang_away + (math.pi * 0.5) * self.strafe_dir
+                vx_des += math.cos(s_ang) * 1.0
+                vy_des += math.sin(s_ang) * 1.0
+        elif primary is not None:
+            # 1v1 duel with HP advantage - rush to kill range
+            ex, ey = primary["pos"][0], primary["pos"][1]
+            d = math.hypot(ex - x, ey - y)
             ang_toward = math.atan2(ey - y, ex - x)
             ang_away = math.atan2(y - ey, x - ex)
 
-            recently_hit = (tick - self.last_threat_tick) < 60
+            ideal_dist = 25.0  # point-blank where spread doesn't matter
+            if hp_frac < 0.90:
+                ideal_dist = 40.0
 
-            # Kill range: point-blank where spread doesn't matter
-            if "lightning" in held_kinds:
-                ideal_dist = 25.0
-            else:
-                ideal_dist = 25.0  # gun at point-blank
-
-            if hp_frac < e_hp_frac * 0.8:
-                ideal_dist = max(ideal_dist, 40.0)
-
-            # If damaged and enemy is far, don't feed damage — retreat to cover
-            if recently_hit and hp_frac < 1.0 and d > 60.0:
-                for e in nearby_enemies:
-                    ex2, ey2 = e["pos"][0], e["pos"][1]
-                    d2 = math.hypot(ex2 - x, ey2 - y)
-                    w = 1.0 + max(0.0, (130.0 - d2) / 130.0)
-                    ang_a = math.atan2(y - ey2, x - ex2)
-                    vx_des += math.cos(ang_a) * w * 2.2
-                    vy_des += math.sin(ang_a) * w * 2.2
-                # seek cover
-                best_cover_ang = None
-                best_cover_score = -999.0
-                for k in range(8):
-                    ca = (tick * 0.08 + k) * (math.pi / 4.0)
-                    cx, cy = x + math.cos(ca) * 16.0, y + math.sin(ca) * 16.0
-                    if self.arena.is_blocked(cx, cy):
-                        score = 1.5
-                        if primary is not None:
-                            mx, my = (x + cx) / 2, (y + cy) / 2
-                            if self.arena.is_blocked(mx, my):
-                                score += 2.0
-                        if score > best_cover_score:
-                            best_cover_score = score
-                            best_cover_ang = ca
-                if best_cover_ang is not None:
-                    vx_des += math.cos(best_cover_ang) * 1.8
-                    vy_des += math.sin(best_cover_ang) * 1.8
-            elif d < ideal_dist * 0.6:
-                # Too close — back off slightly
+            if d < ideal_dist * 0.6:
                 vx_des += math.cos(ang_away) * 1.2
                 vy_des += math.sin(ang_away) * 1.2
             elif d > ideal_dist * 1.3:
-                # Close in at full speed
-                vx_des += math.cos(ang_toward) * 2.0
-                vy_des += math.sin(ang_toward) * 2.0
+                vx_des += math.cos(ang_toward) * 2.2
+                vy_des += math.sin(ang_toward) * 2.2
             else:
-                # In kill range — strafe to be harder to hit
                 s_ang = ang_toward + (math.pi * 0.5) * self.strafe_dir
-                vx_des += math.cos(s_ang) * 1.4
-                vy_des += math.sin(s_ang) * 1.4
+                vx_des += math.cos(s_ang) * 1.5
+                vy_des += math.sin(s_ang) * 1.5
+
+        # NPC farming - engage NPCs when safe (no house bots nearby)
+        if not enemy_mechs or (len(enemy_mechs) == 1 and hp_frac > 0.85 and d_primary > 100.0):
+            if npcs:
+                n = npcs[0]
+                nd = math.dist(n["pos"], me["pos"])
+                if nd < 60.0:
+                    nx_, ny_ = n["pos"][0], n["pos"][1]
+                    ang = math.atan2(ny_ - y, nx_ - x)
+                    vx_des += math.cos(ang) * 1.8
+                    vy_des += math.sin(ang) * 1.8
 
         for snd in obs.get("sounds", []):
             if snd.get("dist") == "near" and snd.get("kind") in ("gun", "laser", "mortar", "lightning", "explosion"):
-                if must_retreat or (hp_frac < 0.50 and not enemy_mechs):
+                if must_retreat or (hp_frac < 0.60 and not enemy_mechs):
                     b = float(snd["bearing"])
                     vx_des -= math.cos(b) * 1.2
                     vy_des -= math.sin(b) * 1.2
@@ -533,6 +524,7 @@ class Bot:
         act["jump"] = bool(must_retreat and me.get("grounded", False) and tick % 28 == 0 and energy > 35.0)
 
         # 7. Target selection & firing
+        # Only fire at house bots when we have HP advantage; otherwise don't telegraph
         muzzle_h = float(me.get("stats", {}).get("muzzle_height", self.cfg.get("mech", {}).get("muzzle_height", 7.0)))
         my_aim = me.get("aim") or [0.0, 0.0]
         has_pitch = len(my_aim) > 1
@@ -592,14 +584,19 @@ class Bot:
             if target is None and not is_charging_laser:
                 self.locked_target_id = None
                 self.lock_lost_tick = -999
-                if enemy_mechs:
-                    target = primary
-                    target_h = 4.5
-                elif npcs and hp_frac > 0.72 and obs.get("alive", 16) > 4:
-                    if math.dist(npcs[0]["pos"], me["pos"]) < 55.0:
-                        target = npcs[0]
+
+                # Target priority: NPCs first (safe farming), then weakened house bots
+                if npcs and hp_frac > 0.70:
+                    n = npcs[0]
+                    if math.dist(n["pos"], me["pos"]) < 60.0:
+                        target = n
                         target_h = 1.75
-                elif obs.get("crates") and hp_frac > 0.68:
+                if target is None and enemy_mechs:
+                    # Only engage house bots with HP advantage
+                    if hp_frac > 0.80 and len(nearby_enemies) <= 1:
+                        target = primary
+                        target_h = 4.5
+                if target is None and obs.get("crates") and hp_frac > 0.70:
                     cr = min(obs["crates"], key=lambda c: math.dist(c["pos"], me["pos"]))
                     if math.dist(cr["pos"], me["pos"]) < 35.0:
                         target = cr
@@ -653,7 +650,7 @@ class Bot:
                         if on_target:
                             fire[best_slot] = True
                     elif pk == "mortar":
-                        if 60.0 <= dist_t <= self.mortar_range and on_target:
+                        if 70.0 <= dist_t <= self.mortar_range and on_target:
                             fire[best_slot] = True
                     elif pk == "lightning":
                         if dist_t <= self.lightning_range and energy >= 18.0 and on_target:
@@ -662,9 +659,9 @@ class Bot:
                         close = dist_t < 80.0
                         charge = float(pw.get("charge", 0.0))
                         full_c = float(ps.get("charge", self.laser_charge))
-                        desired_charge = full_c * (0.25 if close else 0.75)
+                        desired_charge = full_c * (0.25 if close else 0.70)
                         if target_hp < 100.0:
-                            desired_charge = full_c * 0.30
+                            desired_charge = full_c * 0.35
                         if charge >= desired_charge and on_target:
                             fire[best_slot] = False
                             self.locked_target_id = None
@@ -708,9 +705,8 @@ class Bot:
             else:
                 self.locked_target_id = None
                 self.lock_lost_tick = -999
-                if self.last_threat_yaw is not None and tick - self.last_threat_tick < 40:
-                    act["aim"] = [self.last_threat_yaw, 0.0]
-                else:
+                # Don't scan with aim at house bots - don't telegraph
+                if not enemy_mechs:
                     scan_yaw = (tick * 0.14) % (2.0 * math.pi) - math.pi
                     act["aim"] = [scan_yaw, 0.0]
 
