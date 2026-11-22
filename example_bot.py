@@ -69,7 +69,7 @@ class ArenaMap:
 
 
 class Bot:
-    name = "survival-tactician-v19"
+    name = "survival-tactician-v20"
 
     def __init__(self, hello):
         self.cfg = hello.get("config", {})
@@ -78,6 +78,7 @@ class Bot:
         self.arena = ArenaMap(hello.get("map", {}).get("dir", "/arena"),
                               mech_radius=float(mech_cfg.get("radius", 2.5)))
         self.gun_range = float(self.cfg.get("weapons", {}).get("gun", {}).get("range", 230.0))
+        self.mortar_range = float(self.cfg.get("weapons", {}).get("mortar", {}).get("range", 225.0))
         self.lightning_range = float(self.cfg.get("weapons", {}).get("lightning", {}).get("range", 45.0))
         self.strafe_dir = 1.0
         self.prev_vel = {}
@@ -123,7 +124,7 @@ class Bot:
             vel[mid] = sv
             self.prev_vel[mid] = sv
 
-        # Loot pickup (simple: take any new weapon into empty slot)
+        # Loot pickup - prioritize mortar for long-range splash
         for p in obs.get("pickups", []):
             if math.dist(p["pos"][:2], (x, y)) < self.reach and abs(p["pos"][2] - z) < 4.0:
                 pk = p["kind"]
@@ -132,6 +133,13 @@ class Bot:
                 if any(w is None for w in wpn):
                     act["take"] = p["id"]
                     break
+                if not enemies:
+                    cand = sorted(({"laser": 3.5, "lightning": 3.2, "mortar": 4.0, "gun": 1.0}.get(
+                        w["kind"], 1.0), si) for si, w in enumerate(wpn) if w is not None)
+                    if cand and {"laser": 3.5, "lightning": 3.2, "mortar": 4.0, "gun": 1.0}.get(pk, 1.0) > cand[0][0] + 0.3:
+                        act["take"] = p["id"]
+                        act["drop"] = cand[0][1]
+                        break
 
         vx, vy = 0.0, 0.0
         zone = obs["zone"]
@@ -143,7 +151,7 @@ class Bot:
             vx += math.cos(az) * 2.5
             vy += math.sin(az) * 2.5
 
-        # Dodge incoming projectiles (simple perpendicular dodge)
+        # Dodge projectiles
         for pj in obs.get("projectiles", []):
             px, py = pj["pos"][0], pj["pos"][1]
             pvx, pvy = pj.get("vel", [0, 0, 0])[0], pj.get("vel", [0, 0, 0])[1]
@@ -169,8 +177,8 @@ class Bot:
             d = math.hypot(ex - x, ey - y)
             at = math.atan2(ey - y, ex - x)
 
-            # Rush to point-blank (< 30m), then strafe
-            if d > 30.0:
+            # Close to point-blank for gun kill, but fire mortar at long range
+            if d > 40.0:
                 vx += math.cos(at) * 2.5
                 vy += math.sin(at) * 2.5
             else:
@@ -178,7 +186,6 @@ class Bot:
                 vx += math.cos(sa) * 1.8
                 vy += math.sin(sa) * 1.8
         else:
-            # No enemies: farm NPCs or wander
             if npcs:
                 n = npcs[0]
                 nd = math.dist(n["pos"], me["pos"])
@@ -212,7 +219,7 @@ class Bot:
         act["boost"] = bool(enemies and eng > 25.0)
         act["jump"] = bool(False)
 
-        # Fire only at point-blank range where spread doesn't matter
+        # Fire at ALL ranges - mortar for long-range splash, gun for point-blank
         fire = [False, False]
         aim = None
         if enemies:
@@ -223,41 +230,67 @@ class Bot:
             dt = math.dist(tpos, me["pos"])
             thp = float(e.get("hp", 1400.0))
 
-            if dt < 30.0:
-                best_slot, best_u = None, -1.0
-                for i, w in enumerate(wpn):
-                    if w is None:
-                        continue
-                    wk = w["kind"]
-                    if wk == "gun" and dt <= self.gun_range:
-                        u = 10.0 if thp < 150 else 8.0
-                    elif wk == "lightning" and dt <= self.lightning_range and eng >= 18:
-                        u = 9.0 if thp < 150 else 1.0
-                    elif wk == "laser":
-                        u = 2.0 if dt <= 280 else -1.0
+            best_slot, best_u = None, -1.0
+            for i, w in enumerate(wpn):
+                if w is None:
+                    continue
+                wk = w["kind"]
+                cd = float(w.get("cooldown", 0.0))
+                if cd > 0.25:
+                    continue
+                if wk == "gun":
+                    if dt > self.gun_range:
+                        u = 0.5  # weak at long range but better than nothing
+                    elif thp < 150:
+                        u = 10.0
+                    elif dt < 60:
+                        u = 8.0
                     else:
+                        u = 3.0
+                elif wk == "mortar":
+                    if dt < 60 or dt > self.mortar_range:
                         continue
-                    if u > best_u:
-                        best_u = u
-                        best_slot = i
+                    u = 4.0  # mortar splash at long range
+                elif wk == "lightning":
+                    if dt > self.lightning_range or eng < 18:
+                        continue
+                    u = 9.0 if thp < 150 else 2.0
+                elif wk == "laser":
+                    u = 2.0 if dt <= 280 else -1.0
+                else:
+                    continue
+                if u > best_u:
+                    best_u = u
+                    best_slot = i
 
-                if best_slot is not None:
-                    w = wpn[best_slot]
-                    mh = float(me.get("stats", {}).get("muzzle_height", 7.0))
-                    aim = self._aim(me, mh, tpos, tvel, wk, w.get("stats", {}))
-                    act["aim"] = aim
-                    my_aim = me.get("aim", [0, 0])
-                    ye = abs((aim[0] - float(my_aim[0]) + math.pi) % (2 * math.pi) - math.pi)
-                    if wk == "gun" and ye < 0.25:
+            if best_slot is not None:
+                w = wpn[best_slot]
+                mh = float(me.get("stats", {}).get("muzzle_height", 7.0))
+                aim = self._aim(me, mh, tpos, tvel, wk, w.get("stats", {}))
+                act["aim"] = aim
+                my_aim = me.get("aim", [0, 0])
+                my_pitch = float(my_aim[1]) if len(my_aim) > 1 else 0.0
+                ye = abs((aim[0] - float(my_aim[0]) + math.pi) % (2 * math.pi) - math.pi)
+                pe = abs(aim[1] - my_pitch)
+
+                if wk == "gun":
+                    on_target = ye < 0.25 and pe < 0.10
+                    if on_target:
                         fire[best_slot] = True
-                    elif wk == "lightning" and dt <= self.lightning_range and eng >= 18 and ye < 0.4:
+                elif wk == "mortar":
+                    on_target = ye < 0.25 and pe < 0.10
+                    if 60 <= dt <= self.mortar_range and on_target:
                         fire[best_slot] = True
-                    elif wk == "laser":
-                        chg = float(w.get("charge", 0.0))
-                        if chg > 0.5 and ye < 0.1:
-                            fire[best_slot] = False
-                        else:
-                            fire[best_slot] = True
+                elif wk == "lightning":
+                    if dt <= self.lightning_range and eng >= 18 and ye < 0.4:
+                        fire[best_slot] = True
+                elif wk == "laser":
+                    chg = float(w.get("charge", 0.0))
+                    fc = float(w.get("stats", {}).get("charge", 0.75))
+                    if chg >= fc * 0.9 and ye < 0.1 and pe < 0.12:
+                        fire[best_slot] = False
+                    else:
+                        fire[best_slot] = True
 
         if aim is None:
             act["aim"] = [(t * 0.12) % (2 * math.pi) - math.pi, 0.0]
