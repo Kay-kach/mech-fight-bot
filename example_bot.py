@@ -100,7 +100,7 @@ class ArenaMap:
 
 
 class Bot:
-    name = "survival-tactician-v12"
+    name = "survival-tactician-v13"
 
     def __init__(self, hello: mf.Hello):
         self.slot = int(hello.get("slot", 0))
@@ -176,10 +176,10 @@ class Bot:
             if float(w.get("cooldown", 0.0)) > 0.25:
                 return 0.2
             if rushed:
-                return 0.1  # never charge while being rushed
+                return 0.1
             if target_hp < 100.0:
                 return 0.5
-            return 1.0  # laser telegraphs too much; avoid in duels
+            return 1.0  # laser telegraphs; avoid in duels
 
         if wk == "gun":
             if dist > self.gun_range:
@@ -187,14 +187,14 @@ class Bot:
             if float(w.get("reload", 0.0)) > 0.15:
                 return 0.1
             if target_hp < 150.0 and int(w.get("ammo", 12)) > 0:
-                return 8.0
-            return 6.0
+                return 9.0
+            return 7.0
 
         if wk == "lightning":
             if dist > self.lightning_range or energy < 18.0:
                 return -1.0
             if target_hp < 150.0:
-                return 7.0
+                return 8.0
             if "laser" in enemy_weapons:
                 return 2.0
             return 1.0
@@ -267,6 +267,36 @@ class Bot:
         yaw = math.atan2(dy, dx)
         pitch = math.atan2(dz, max(math.hypot(dx, dy), 0.01))
         return [yaw, clamp(pitch, -1.3, 1.3)]
+
+    def _dodge_vector(self, x: float, y: float, projectiles: list) -> tuple[float, float]:
+        """Compute movement vector to dodge incoming projectiles."""
+        dodge_vx, dodge_vy = 0.0, 0.0
+        for p in projectiles:
+            px, py = p["pos"][0], p["pos"][1]
+            pvx, pvy = p.get("vel", [0.0, 0.0])[0], p.get("vel", [0.0, 0.0])[1]
+            d = math.hypot(px - x, py - y)
+            if d < 60.0 and d > 2.0:
+                # Projectile heading toward us? Check if velocity points roughly at us
+                to_me_x, to_me_y = x - px, y - py
+                to_me_dist = math.hypot(to_me_x, to_me_y)
+                if to_me_dist > 0.01:
+                    to_me_x /= to_me_dist
+                    to_me_y /= to_me_dist
+                    vel_dist = math.hypot(pvx, pvy)
+                    if vel_dist > 0.01:
+                        align = (pvx / vel_dist) * to_me_x + (pvy / vel_dist) * to_me_y
+                        if align > 0.3:  # heading toward us
+                            # Perpendicular dodge direction
+                            perp_x, perp_y = -to_me_y, to_me_x
+                            # Pick direction with better clearance
+                            clear1 = self.arena.path_clearance(x, y, math.atan2(perp_y, perp_x))
+                            clear2 = self.arena.path_clearance(x, y, math.atan2(-perp_y, -perp_x))
+                            if clear2 > clear1:
+                                perp_x, perp_y = -perp_x, -perp_y
+                            speed_factor = max(0.0, (60.0 - d) / 60.0)
+                            dodge_vx += perp_x * 2.5 * speed_factor
+                            dodge_vy += perp_y * 2.5 * speed_factor
+        return dodge_vx, dodge_vy
 
     def _act(self, obs: mf.Observation) -> mf.Action:
         tick = int(obs["tick"])
@@ -361,7 +391,7 @@ class Bot:
 
         rushed = len(nearby_enemies) >= 2
 
-        # 6. Movement strategy
+        # 6. Movement
         vx_des, vy_des = 0.0, 0.0
         z_cur = obs["zone"]
         nx, ny = z_cur["next_center"]
@@ -375,18 +405,14 @@ class Bot:
             vx_des += math.cos(az) * w_zone
             vy_des += math.sin(az) * w_zone
 
-        # Early/mid game: avoid house bots, farm NPCs
-        # Only engage house bots when we have HP advantage and it's 1v1
-        can_fight_house = (
-            hp_frac > 0.80
-            and len(nearby_enemies) <= 1
-            and cubes >= 3  # have some HP upgrades
-        )
+        # Projectile dodging (highest priority when projectiles nearby)
+        dodge_vx, dodge_vy = self._dodge_vector(x, y, obs.get("projectiles", []))
+        dodging = math.hypot(dodge_vx, dodge_vy) > 0.1
 
         if must_retreat := (
             len(nearby_enemies) >= 2
-            or (len(nearby_enemies) >= 1 and hp_frac < 0.55)
-            or (primary is not None and d_primary < 60.0 and hp_frac < 0.75)
+            or (len(nearby_enemies) >= 1 and hp_frac < 0.40)
+            or (primary is not None and d_primary < 70.0 and hp_frac < 0.65)
         ):
             # Retreat away from all nearby enemies
             for e in nearby_enemies:
@@ -394,8 +420,8 @@ class Bot:
                 d = math.hypot(ex - x, ey - y)
                 w = 1.0 + max(0.0, (130.0 - d) / 130.0)
                 ang_away = math.atan2(y - ey, x - ex)
-                vx_des += math.cos(ang_away) * w * 2.6
-                vy_des += math.sin(ang_away) * w * 2.6
+                vx_des += math.cos(ang_away) * w * 2.8
+                vy_des += math.sin(ang_away) * w * 2.8
             # Seek cover
             best_cover_ang = None
             best_cover_score = -999.0
@@ -412,52 +438,42 @@ class Bot:
                         best_cover_score = score
                         best_cover_ang = ca
             if best_cover_ang is not None:
-                vx_des += math.cos(best_cover_ang) * 2.0
-                vy_des += math.sin(best_cover_ang) * 2.0
-        elif not can_fight_house and enemy_mechs:
-            # Avoid house bots - keep distance, don't engage
-            ex, ey = primary["pos"][0], primary["pos"][1]
-            d = math.hypot(ex - x, ey - y)
-            ang_away = math.atan2(y - ey, x - ex)
-            if d < 90.0:
-                vx_des += math.cos(ang_away) * 2.0
-                vy_des += math.sin(ang_away) * 2.0
-            elif d < 130.0:
-                s_ang = ang_away + (math.pi * 0.5) * self.strafe_dir
-                vx_des += math.cos(s_ang) * 1.0
-                vy_des += math.sin(s_ang) * 1.0
+                vx_des += math.cos(best_cover_ang) * 2.2
+                vy_des += math.sin(best_cover_ang) * 2.2
+        elif dodging:
+            # Dodging takes priority over engagement
+            vx_des += dodge_vx
+            vy_des += dodge_vy
         elif primary is not None:
-            # 1v1 duel with HP advantage - rush to kill range
+            # 1v1: close to point-blank, strafe, shoot
             ex, ey = primary["pos"][0], primary["pos"][1]
             d = math.hypot(ex - x, ey - y)
             ang_toward = math.atan2(ey - y, ex - x)
             ang_away = math.atan2(y - ey, x - ex)
 
             ideal_dist = 25.0  # point-blank where spread doesn't matter
-            if hp_frac < 0.90:
-                ideal_dist = 40.0
 
-            if d < ideal_dist * 0.6:
-                vx_des += math.cos(ang_away) * 1.2
-                vy_des += math.sin(ang_away) * 1.2
-            elif d > ideal_dist * 1.3:
-                vx_des += math.cos(ang_toward) * 2.2
-                vy_des += math.sin(ang_toward) * 2.2
+            if d < ideal_dist * 0.5:
+                vx_des += math.cos(ang_away) * 1.0
+                vy_des += math.sin(ang_away) * 1.0
+            elif d > ideal_dist * 1.4:
+                vx_des += math.cos(ang_toward) * 2.4
+                vy_des += math.sin(ang_toward) * 2.4
             else:
                 s_ang = ang_toward + (math.pi * 0.5) * self.strafe_dir
-                vx_des += math.cos(s_ang) * 1.5
-                vy_des += math.sin(s_ang) * 1.5
+                vx_des += math.cos(s_ang) * 1.8
+                vy_des += math.sin(s_ang) * 1.8
 
-        # NPC farming - engage NPCs when safe (no house bots nearby)
-        if not enemy_mechs or (len(enemy_mechs) == 1 and hp_frac > 0.85 and d_primary > 100.0):
+        # NPC farming only when safe
+        if not must_retreat and not dodging and not enemy_mechs:
             if npcs:
                 n = npcs[0]
                 nd = math.dist(n["pos"], me["pos"])
-                if nd < 60.0:
+                if nd < 55.0:
                     nx_, ny_ = n["pos"][0], n["pos"][1]
                     ang = math.atan2(ny_ - y, nx_ - x)
-                    vx_des += math.cos(ang) * 1.8
-                    vy_des += math.sin(ang) * 1.8
+                    vx_des += math.cos(ang) * 1.6
+                    vy_des += math.sin(ang) * 1.6
 
         for snd in obs.get("sounds", []):
             if snd.get("dist") == "near" and snd.get("kind") in ("gun", "laser", "mortar", "lightning", "explosion"):
@@ -466,7 +482,7 @@ class Bot:
                     vx_des -= math.cos(b) * 1.2
                     vy_des -= math.sin(b) * 1.2
 
-        if not must_retreat and not enemy_mechs and in_zone:
+        if not must_retreat and not dodging and not enemy_mechs and in_zone:
             if obs.get("cubes"):
                 c = min(obs["cubes"], key=lambda it: math.dist(it["pos"], me["pos"]))
                 if math.dist(c["pos"][:2], (x, y)) < 65.0:
@@ -486,7 +502,7 @@ class Bot:
                     vx_des += math.cos(acr) * 1.1
                     vy_des += math.sin(acr) * 1.1
 
-        if not must_retreat and not enemy_mechs and hp_frac > 0.65:
+        if not must_retreat and not dodging and not enemy_mechs and hp_frac > 0.65:
             for dr in obs.get("drops", []):
                 if (
                     math.dist(dr["pos"][:2], (x, y)) < 45.0
@@ -520,11 +536,10 @@ class Bot:
                 best_move_ang = cand_ang
 
         act["move"] = [math.cos(best_move_ang) * des_mag, math.sin(best_move_ang) * des_mag]
-        act["boost"] = bool((must_retreat or not in_zone) and energy > 22.0)
+        act["boost"] = bool((must_retreat or dodging or not in_zone) and energy > 22.0)
         act["jump"] = bool(must_retreat and me.get("grounded", False) and tick % 28 == 0 and energy > 35.0)
 
         # 7. Target selection & firing
-        # Only fire at house bots when we have HP advantage; otherwise don't telegraph
         muzzle_h = float(me.get("stats", {}).get("muzzle_height", self.cfg.get("mech", {}).get("muzzle_height", 7.0)))
         my_aim = me.get("aim") or [0.0, 0.0]
         has_pitch = len(my_aim) > 1
@@ -585,18 +600,16 @@ class Bot:
                 self.locked_target_id = None
                 self.lock_lost_tick = -999
 
-                # Target priority: NPCs first (safe farming), then weakened house bots
-                if npcs and hp_frac > 0.70:
+                # Target priority: house bots with HP advantage first, then NPCs
+                if enemy_mechs and hp_frac > 0.75 and len(nearby_enemies) <= 1:
+                    target = primary
+                    target_h = 4.5
+                elif npcs and hp_frac > 0.70:
                     n = npcs[0]
-                    if math.dist(n["pos"], me["pos"]) < 60.0:
+                    if math.dist(n["pos"], me["pos"]) < 55.0:
                         target = n
                         target_h = 1.75
-                if target is None and enemy_mechs:
-                    # Only engage house bots with HP advantage
-                    if hp_frac > 0.80 and len(nearby_enemies) <= 1:
-                        target = primary
-                        target_h = 4.5
-                if target is None and obs.get("crates") and hp_frac > 0.70:
+                elif obs.get("crates") and hp_frac > 0.70:
                     cr = min(obs["crates"], key=lambda c: math.dist(c["pos"], me["pos"]))
                     if math.dist(cr["pos"], me["pos"]) < 35.0:
                         target = cr
@@ -705,7 +718,7 @@ class Bot:
             else:
                 self.locked_target_id = None
                 self.lock_lost_tick = -999
-                # Don't scan with aim at house bots - don't telegraph
+                # Don't scan/telegraph at house bots
                 if not enemy_mechs:
                     scan_yaw = (tick * 0.14) % (2.0 * math.pi) - math.pi
                     act["aim"] = [scan_yaw, 0.0]
