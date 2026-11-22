@@ -11,7 +11,6 @@ def clamp(val: float, lo: float, hi: float) -> float:
 
 
 def angle_diff(a: float, b: float) -> float:
-    """Shortest signed angle from b to a in [-pi, pi]."""
     return (a - b + math.pi) % (2.0 * math.pi) - math.pi
 
 
@@ -31,8 +30,6 @@ def point_in_poly(x: float, y: float, ring: list[float]) -> bool:
 
 
 class ArenaMap:
-    """2.0m resolution obstacle grid with mech-radius clearance buffer."""
-
     def __init__(self, map_dir: str, mech_radius: float = 2.5):
         self.blocked: set[tuple[int, int]] = set()
         self.cell_size = 2.0
@@ -47,8 +44,7 @@ class ArenaMap:
             pad = self.pad
             diag = pad * 0.7071
             offsets = (
-                (0.0, 0.0),
-                (pad, 0.0), (-pad, 0.0),
+                (0.0, 0.0), (pad, 0.0), (-pad, 0.0),
                 (0.0, pad), (0.0, -pad),
                 (diag, diag), (diag, -diag), (-diag, diag), (-diag, -diag),
             )
@@ -104,7 +100,7 @@ class ArenaMap:
 
 
 class Bot:
-    name = "survival-tactician-v7"
+    name = "survival-tactician-v8"
 
     def __init__(self, hello: mf.Hello):
         self.slot = int(hello.get("slot", 0))
@@ -135,7 +131,6 @@ class Bot:
         self.prev_enemy_vel: dict[int, list[float]] = {}
         self.last_known_pos: dict[int, list[float]] = {}
         self.last_seen_tick: dict[int, int] = {}
-        self.damage_received_tick: dict[int, int] = {}
 
         self.locked_target_id: int | None = None
         self.locked_target_h: float = 4.5
@@ -182,10 +177,10 @@ class Bot:
             if float(w.get("cooldown", 0.0)) > 0.25:
                 return 0.2
             if rushed:
-                return 0.5  # don't commit to a long charge while being rushed
+                return 0.4  # never commit to a long charge while being rushed
             if target_hp < 120.0:
-                return 2.0  # gun finishes low-HP faster
-            return 4.0
+                return 1.5  # gun finishes low-HP faster
+            return 3.5
 
         if wk == "gun":
             if dist > self.gun_range:
@@ -193,26 +188,26 @@ class Bot:
             if float(w.get("reload", 0.0)) > 0.15:
                 return 0.1
             if target_hp < 150.0 and int(w.get("ammo", 12)) > 0:
-                return 5.0
-            return 3.0
+                return 5.5
+            return 3.5
 
         if wk == "lightning":
             if dist > self.lightning_range or energy < 18.0:
                 return -1.0
             if target_hp < 150.0:
-                return 4.5
+                return 5.0
             if "laser" in enemy_weapons:
-                return 3.0
-            return 1.5
+                return 2.5
+            return 1.2
 
         if wk == "mortar":
-            if dist < 30.0 or dist > self.mortar_range:
+            if dist < 40.0 or dist > self.mortar_range:
                 return -1.0
             if float(w.get("cooldown", 0.0)) > 0.25:
                 return 0.2
             if rushed:
                 return 0.3
-            return 3.0
+            return 2.8
 
         return 0.0
 
@@ -298,16 +293,14 @@ class Bot:
         if obs.get("offer"):
             act["pick"] = self._choose_upgrade(obs["offer"])
 
-        # 2. Track incoming damage bearing / shooter
+        # 2. Track incoming damage
         for ev in obs.get("events", []):
             if ev.get("type") == "damaged":
                 self.last_threat_yaw = float(ev["bearing"]) if ev.get("bearing") is not None else None
                 self.last_threat_tick = tick
                 self.last_threat_id = int(ev["by"]) if ev.get("by") is not None else None
-                if self.last_threat_id is not None:
-                    self.damage_received_tick[self.last_threat_id] = tick
 
-        # 3. Categorize visible enemies & NPCs and update tracking memory
+        # 3. Categorize visible enemies & NPCs
         enemy_mechs = [m for m in obs.get("mechs", []) if m.get("kind") == "mech"]
         npcs = [m for m in obs.get("mechs", []) if m.get("kind") == "npc"]
         enemy_mechs.sort(key=lambda m: math.dist(m["pos"], me["pos"]))
@@ -333,10 +326,9 @@ class Bot:
                 self.last_seen_tick.pop(mid, None)
                 self.last_known_pos.pop(mid, None)
                 self.prev_enemy_vel.pop(mid, None)
-                self.damage_received_tick.pop(mid, None)
 
-        # 4. Weapon loot pickup (never swap during combat or while charging)
-        in_combat = (len(enemy_mechs) + len(npcs)) > 0
+        # 4. Weapon loot pickup
+        in_combat = len(enemy_mechs) > 0
         for p in obs.get("pickups", []):
             if math.dist(p["pos"][:2], (x, y)) < self.reach and abs(p["pos"][2] - z) < 4.0:
                 pk = p["kind"]
@@ -347,7 +339,9 @@ class Bot:
                     act["take"] = p["id"]
                     break
                 if not in_combat and not is_charging_laser:
-                    candidates = sorted((self._pickup_value(w["kind"]), si) for si, w in enumerate(weapons) if w is not None)
+                    candidates = sorted(
+                        (self._pickup_value(w["kind"]), si) for si, w in enumerate(weapons) if w is not None
+                    )
                     if candidates and self._pickup_value(pk) > candidates[0][0] + 0.4:
                         act["take"] = p["id"]
                         act["drop"] = candidates[0][1]
@@ -355,9 +349,11 @@ class Bot:
 
         # 5. Threat assessment
         nearby_enemies = [m for m in enemy_mechs if math.dist(me["pos"], m["pos"]) < 130.0]
-        # primary threat = the enemy that shot us most recently, else closest
+        d_primary = math.dist(enemy_mechs[0]["pos"], me["pos"]) if enemy_mechs else 999.0
+
+        # Primary threat = the one that damaged us most recently, else closest
         primary = None
-        if self.last_threat_id is not None and tick - self.damage_received_tick.get(self.last_threat_id, -999) < 60:
+        if self.last_threat_id is not None and tick - self.last_threat_tick < 60:
             for m in enemy_mechs:
                 if int(m["id"]) == self.last_threat_id:
                     primary = m
@@ -365,21 +361,17 @@ class Bot:
         if primary is None and enemy_mechs:
             primary = enemy_mechs[0]
 
-        d_primary = math.dist(primary["pos"], me["pos"]) if primary else 999.0
-        rushed = len(nearby_enemies) >= 2 or (len(nearby_enemies) >= 1 and hp_frac < 0.55)
+        rushed = len(nearby_enemies) >= 2
 
+        # Retreat: outnumbered, or low HP vs any nearby enemy
         must_retreat = (
-            (len(nearby_enemies) >= 2)
+            len(nearby_enemies) >= 2
             or (len(nearby_enemies) >= 1 and hp_frac < 0.50)
-            or (primary is not None and d_primary < 45.0 and hp_frac < 0.70)
+            or (primary is not None and d_primary < 50.0 and hp_frac < 0.60)
         )
 
-        third_party_opportunity = False
-        if len(enemy_mechs) >= 2 and hp_frac >= 0.60:
-            d_me_e0 = math.dist(me["pos"], enemy_mechs[0]["pos"])
-            d_e0_e1 = math.dist(enemy_mechs[0]["pos"], enemy_mechs[1]["pos"])
-            if d_e0_e1 < d_me_e0 * 0.8 and d_me_e0 > 70.0:
-                third_party_opportunity = True
+        # House bots never fight each other, so third-party vs them is impossible.
+        # Only third-party if there are NPCs fighting each other (rare) - skip.
 
         # 6. Desired movement vector
         vx_des, vy_des = 0.0, 0.0
@@ -395,66 +387,39 @@ class Bot:
             vx_des += math.cos(az) * w_zone
             vy_des += math.sin(az) * w_zone
 
-        cover_bonus = 0.0
-        cover_ang = None
-        if must_retreat or rushed:
-            # retreat away from primary threat, weighted by all nearby enemies
+        if must_retreat:
+            # Retreat away from all nearby enemies, weighted by closeness
             for e in nearby_enemies:
                 ex, ey = e["pos"][0], e["pos"][1]
                 d = math.hypot(ex - x, ey - y)
-                w = 1.0 + max(0.0, (130.0 - d) / 130.0)  # closer = stronger push
+                w = 1.0 + max(0.0, (130.0 - d) / 130.0)
                 ang_away = math.atan2(y - ey, x - ex)
-                vx_des += math.cos(ang_away) * w * 2.2
-                vy_des += math.sin(ang_away) * w * 2.2
-            # seek cover: prefer moving toward a blocked cell (wall) to break LOS
-            best_cover_score = -999.0
-            for k in range(8):
-                ca = (tick * 0.1 + k) * (math.pi / 4.0)
-                cx, cy = x + math.cos(ca) * 14.0, y + math.sin(ca) * 14.0
-                if self.arena.is_blocked(cx, cy):
-                    # moving toward cover is good if it also blocks line to primary
-                    score = 1.5
-                    if primary is not None:
-                        # check if cover is between us and primary
-                        px, py = primary["pos"][0], primary["pos"][1]
-                        mx, my = (x + cx) / 2, (y + cy) / 2
-                        if self.arena.is_blocked(mx, my):
-                            score += 2.0
-                    if score > best_cover_score:
-                        best_cover_score = score
-                        cover_ang = ca
-            if cover_ang is not None:
-                vx_des += math.cos(cover_ang) * 1.6
-                vy_des += math.sin(cover_ang) * 1.6
-        elif third_party_opportunity:
-            e = nearby_enemies[0] if nearby_enemies else enemy_mechs[0]
-            ex, ey = e["pos"][0], e["pos"][1]
+                vx_des += math.cos(ang_away) * w * 2.4
+                vy_des += math.sin(ang_away) * w * 2.4
+        elif primary is not None:
+            # 1v1: kite at optimal range, strafe
+            ex, ey = primary["pos"][0], primary["pos"][1]
             d = math.hypot(ex - x, ey - y)
+            e_hp_frac = float(primary.get("hp", 1400.0)) / max(float(primary.get("max_hp", 1400.0)), 1.0)
             ang_away = math.atan2(y - ey, x - ex)
-            if d < 65.0:
+            # Ideal range: close for lightning, mid for gun/laser, far if we're weaker
+            if "lightning" in held_kinds:
+                ideal_dist = 28.0
+            elif "laser" in held_kinds:
+                ideal_dist = 120.0
+            else:
+                ideal_dist = 55.0
+            if hp_frac < e_hp_frac:
+                ideal_dist = max(ideal_dist, 90.0)  # keep distance if weaker
+            if d < ideal_dist * 0.75:
                 vx_des += math.cos(ang_away) * 1.8
                 vy_des += math.sin(ang_away) * 1.8
-            elif d > 100.0:
+            elif d > ideal_dist * 1.4 and hp_frac > 0.70:
                 vx_des -= math.cos(ang_away) * 0.9
                 vy_des -= math.sin(ang_away) * 0.9
-        else:
-            # engage: keep ideal distance from primary, strafe
-            e = primary if primary else (enemy_mechs[0] if enemy_mechs else None)
-            if e is not None:
-                ex, ey = e["pos"][0], e["pos"][1]
-                d = math.hypot(ex - x, ey - y)
-                e_hp_frac = float(e.get("hp", 1400.0)) / max(float(e.get("max_hp", 1400.0)), 1.0)
-                ang_away = math.atan2(y - ey, x - ex)
-                ideal_dist = 30.0 if "lightning" in held_kinds else 55.0
-                if d < ideal_dist * 0.7:
-                    vx_des += math.cos(ang_away) * 1.6
-                    vy_des += math.sin(ang_away) * 1.6
-                elif d > ideal_dist * 1.5 and hp_frac > 0.75:
-                    vx_des -= math.cos(ang_away) * 0.8
-                    vy_des -= math.sin(ang_away) * 0.8
-                s_ang = ang_away + (math.pi * 0.5) * self.strafe_dir
-                vx_des += math.cos(s_ang) * 1.1
-                vy_des += math.sin(s_ang) * 1.1
+            s_ang = ang_away + (math.pi * 0.5) * self.strafe_dir
+            vx_des += math.cos(s_ang) * 1.2
+            vy_des += math.sin(s_ang) * 1.2
 
         for snd in obs.get("sounds", []):
             if snd.get("dist") == "near" and snd.get("kind") in ("gun", "laser", "mortar", "lightning", "explosion"):
@@ -641,15 +606,19 @@ class Bot:
                         if on_target:
                             fire[best_slot] = True
                     elif pk == "mortar":
-                        if 30.0 <= dist_t <= self.mortar_range and on_target:
+                        if 40.0 <= dist_t <= self.mortar_range and on_target:
                             fire[best_slot] = True
                     elif pk == "lightning":
                         if dist_t <= self.lightning_range and energy >= 18.0 and on_target:
                             fire[best_slot] = True
                     elif pk == "laser":
+                        # Don't charge laser at close range (telegraphs position, half speed)
+                        close = dist_t < 70.0
                         charge = float(pw.get("charge", 0.0))
                         full_c = float(ps.get("charge", self.laser_charge))
-                        desired_charge = full_c * (0.40 if target_hp < 120.0 else 0.90)
+                        desired_charge = full_c * (0.35 if target_hp < 120.0 else 0.85)
+                        if close:
+                            desired_charge = full_c * 0.30  # quick snap shot at close range
                         if charge >= desired_charge and on_target:
                             fire[best_slot] = False
                             self.locked_target_id = None
@@ -657,7 +626,7 @@ class Bot:
                         else:
                             fire[best_slot] = True
 
-                    # secondary weapon, independent aim, overkill guard
+                    # Secondary weapon, independent aim
                     other_slot = 1 - best_slot
                     ow = weapons[other_slot]
                     if ow is not None and pk != "mortar" and ow["kind"] != "mortar":
