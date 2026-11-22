@@ -103,7 +103,7 @@ class ArenaMap:
 
 
 class Bot:
-    name = "survival-tactician-v34"
+    name = "survival-tactician-v35"
 
     def __init__(self, hello):
         self.slot = int(hello.get("slot", 0))
@@ -123,6 +123,8 @@ class Bot:
 
         self.last_damage_tick = -9999
         self.strafe_dir = 1.0
+        self.jitter_dir = 0.0
+        self.jitter_until_tick = -999
         self.prev_enemy_vel = {}
         self.last_known_pos = {}
         self.last_seen_tick = {}
@@ -420,7 +422,14 @@ class Bot:
             vx_des = math.cos(ai) * 0.75
             vy_des = math.sin(ai) * 0.75
 
+        # Jitter: every 6-12 ticks, pick a new random direction offset to break enemy aim prediction
+        if nearby_enemies and tick > self.jitter_until_tick:
+            self.jitter_dir = self.rng.uniform(-math.pi, math.pi)
+            self.jitter_until_tick = tick + self.rng.randint(6, 12)
+
         des_ang = math.atan2(vy_des, vx_des)
+        if nearby_enemies:
+            des_ang += self.jitter_dir * 0.6
         des_mag = min(1.0, math.hypot(vx_des, vy_des))
 
         if len(nearby_enemies) > 0:
