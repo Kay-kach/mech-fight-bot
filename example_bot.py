@@ -69,7 +69,7 @@ class ArenaMap:
 
 
 class Bot:
-    name = "survival-tactician-v21"
+    name = "survival-tactician-v23"
 
     def __init__(self, hello):
         self.cfg = hello.get("config", {})
@@ -78,6 +78,8 @@ class Bot:
         self.arena = ArenaMap(hello.get("map", {}).get("dir", "/arena"),
                               mech_radius=float(mech_cfg.get("radius", 2.5)))
         self.gun_range = float(self.cfg.get("weapons", {}).get("gun", {}).get("range", 230.0))
+        self.lightning_range = float(self.cfg.get("weapons", {}).get("lightning", {}).get("range", 45.0))
+        self.laser_range = float(self.cfg.get("weapons", {}).get("laser", {}).get("range", 280.0))
         self.strafe_dir = 1.0
 
     def act(self, obs):
@@ -99,6 +101,7 @@ class Bot:
         eng = float(me["energy"])
         wpn = me["weapons"]
         held = [w["kind"] for w in wpn if w is not None]
+        mh = float(me.get("stats", {}).get("muzzle_height", 7.0))
 
         act = {"tick": t}
 
@@ -108,7 +111,7 @@ class Bot:
         enemies = [m for m in obs.get("mechs", []) if m.get("kind") == "mech"]
         enemies.sort(key=lambda m: math.dist(m["pos"], me["pos"]))
 
-        # Loot pickup - take any weapon into empty slot
+        # Loot pickup - prioritize lightning/laser over gun
         for p in obs.get("pickups", []):
             if math.dist(p["pos"][:2], (x, y)) < self.reach and abs(p["pos"][2] - z) < 4.0:
                 pk = p["kind"]
@@ -136,14 +139,14 @@ class Bot:
             d = math.hypot(ex - x, ey - y)
             at = math.atan2(ey - y, ex - x)
 
-            # Rush to point-blank, then strafe
+            # Rush to point-blank (< 40m), then strafe in place (never stop moving)
             if d > 40.0:
                 vx += math.cos(at) * 2.5
                 vy += math.sin(at) * 2.5
             else:
                 sa = at + (math.pi * 0.5) * self.strafe_dir
-                vx += math.cos(sa) * 1.8
-                vy += math.sin(sa) * 1.8
+                vx += math.cos(sa) * 2.0
+                vy += math.sin(sa) * 2.0
         else:
             vx += math.cos(t * 0.1) * 0.4
             vy += math.sin(t * 0.1) * 0.4
@@ -168,7 +171,7 @@ class Bot:
         act["boost"] = bool(enemies and eng > 25.0)
         act["jump"] = bool(False)
 
-        # Fire gun at nearest enemy when on target
+        # Fire at nearest enemy
         fire = [False, False]
         aim = None
         if enemies:
@@ -177,16 +180,25 @@ class Bot:
             dt = math.dist(tpos, me["pos"])
             thp = float(e.get("hp", 1400.0))
 
-            if dt <= self.gun_range:
-                mh = float(me.get("stats", {}).get("muzzle_height", 7.0))
+            # Gun: fire when on target
+            if wpn[0] and wpn[0]["kind"] == "gun" and dt <= self.gun_range:
                 aim = self._aim_gun(me, mh, tpos)
                 act["aim"] = aim
                 my_aim = me.get("aim", [0, 0])
                 ye = abs((aim[0] - float(my_aim[0]) + math.pi) % (2 * math.pi) - math.pi)
                 my_pitch = float(my_aim[1]) if len(my_aim) > 1 else 0.0
                 pe = abs(aim[1] - my_pitch)
-                if ye < 0.20 and pe < 0.08:
+                if ye < 0.25 and pe < 0.12:
                     fire[0] = True
+
+            # Lightning at close range on low-HP targets
+            if wpn[1] and wpn[1]["kind"] == "lightning" and dt <= self.lightning_range and eng >= 18:
+                aim2 = self._aim_gun(me, mh, tpos)
+                act["aim"] = aim2
+                my_aim2 = me.get("aim", [0, 0])
+                ye2 = abs((aim2[0] - float(my_aim2[0]) + math.pi) % (2 * math.pi) - math.pi)
+                if ye2 < 0.45 and thp < 150:
+                    fire[1] = True
 
         if aim is None:
             act["aim"] = [(t * 0.12) % (2 * math.pi) - math.pi, 0.0]
