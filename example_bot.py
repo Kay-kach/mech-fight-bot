@@ -69,7 +69,7 @@ class ArenaMap:
 
 
 class Bot:
-    name = "survival-tactician-v24"
+    name = "survival-tactician-v25"
 
     def __init__(self, hello):
         self.cfg = hello.get("config", {})
@@ -78,7 +78,6 @@ class Bot:
         self.arena = ArenaMap(hello.get("map", {}).get("dir", "/arena"),
                               mech_radius=float(mech_cfg.get("radius", 2.5)))
         self.gun_range = float(self.cfg.get("weapons", {}).get("gun", {}).get("range", 230.0))
-        self.mortar_range = float(self.cfg.get("weapons", {}).get("mortar", {}).get("range", 225.0))
         self.lightning_range = float(self.cfg.get("weapons", {}).get("lightning", {}).get("range", 45.0))
         self.laser_range = float(self.cfg.get("weapons", {}).get("laser", {}).get("range", 280.0))
         self.strafe_dir = 1.0
@@ -112,7 +111,7 @@ class Bot:
         enemies = [m for m in obs.get("mechs", []) if m.get("kind") == "mech"]
         enemies.sort(key=lambda m: math.dist(m["pos"], me["pos"]))
 
-        # Loot pickup - prioritize mortar for long-range splash
+        # Loot pickup - prioritize lightning, then laser
         for p in obs.get("pickups", []):
             if math.dist(p["pos"][:2], (x, y)) < self.reach and abs(p["pos"][2] - z) < 4.0:
                 pk = p["kind"]
@@ -140,17 +139,14 @@ class Bot:
             d = math.hypot(ex - x, ey - y)
             at = math.atan2(ey - y, ex - x)
 
-            # Mortar-focused: stay at 60-150m, fire mortar (splash doesn't need precision)
-            # Rush to point-blank only for gun finish on low-HP targets
-            if d > 150.0:
-                vx += math.cos(at) * 2.0  # close slowly
-                vy += math.sin(at) * 2.0
-            elif d < 30.0:
-                # Point-blank: strafe to break aim, gun finish
+            # Close to lightning range (< 40m), strafe continuously
+            if d > 40.0:
+                vx += math.cos(at) * 2.5
+                vy += math.sin(at) * 2.5
+            else:
                 sa = at + (math.pi * 0.5) * self.strafe_dir
                 vx += math.cos(sa) * 2.0
                 vy += math.sin(sa) * 2.0
-            # Between 30-150m: stay put, don't expose by moving
         else:
             vx += math.cos(t * 0.1) * 0.4
             vy += math.sin(t * 0.1) * 0.4
@@ -175,7 +171,7 @@ class Bot:
         act["boost"] = bool(enemies and eng > 25.0)
         act["jump"] = bool(False)
 
-        # Fire at nearest enemy
+        # Fire lightning at close range (perfect aim, no spread, 60 dmg)
         fire = [False, False]
         aim = None
         if enemies:
@@ -184,62 +180,40 @@ class Bot:
             dt = math.dist(tpos, me["pos"])
             thp = float(e.get("hp", 1400.0))
 
-            # Mortar: primary long-range weapon (splash doesn't need precision)
-            if wpn[0] and wpn[0]["kind"] == "mortar" and 30 <= dt <= self.mortar_range:
-                aim = self._aim_mortar(me, mh, tpos)
+            # Lightning primary - perfect aim at close range
+            if wpn[0] and wpn[0]["kind"] == "lightning" and dt <= self.lightning_range and eng >= 18:
+                aim = self._aim_point(me, mh, tpos)
                 act["aim"] = aim
                 my_aim = me.get("aim", [0, 0])
                 ye = abs((aim[0] - float(my_aim[0]) + math.pi) % (2 * math.pi) - math.pi)
-                my_pitch = float(my_aim[1]) if len(my_aim) > 1 else 0.0
-                pe = abs(aim[1] - my_pitch)
-                if ye < 0.30 and pe < 0.15:
+                if ye < 0.40:
                     fire[0] = True
-            elif wpn[1] and wpn[1]["kind"] == "mortar" and 30 <= dt <= self.mortar_range:
-                aim = self._aim_mortar(me, mh, tpos)
+            elif wpn[1] and wpn[1]["kind"] == "lightning" and dt <= self.lightning_range and eng >= 18:
+                aim = self._aim_point(me, mh, tpos)
                 act["aim"] = aim
                 my_aim = me.get("aim", [0, 0])
                 ye = abs((aim[0] - float(my_aim[0]) + math.pi) % (2 * math.pi) - math.pi)
-                my_pitch = float(my_aim[1]) if len(my_aim) > 1 else 0.0
-                pe = abs(aim[1] - my_pitch)
-                if ye < 0.30 and pe < 0.15:
+                if ye < 0.40:
                     fire[1] = True
 
-            # Gun: point-blank finish on low-HP targets
-            elif wpn[0] and wpn[0]["kind"] == "gun" and dt <= 40.0:
-                aim = self._aim_gun(me, mh, tpos)
+            # Gun secondary at point-blank
+            elif wpn[0] and wpn[0]["kind"] == "gun" and dt <= 30.0:
+                aim = self._aim_point(me, mh, tpos)
                 act["aim"] = aim
                 my_aim = me.get("aim", [0, 0])
                 ye = abs((aim[0] - float(my_aim[0]) + math.pi) % (2 * math.pi) - math.pi)
                 my_pitch = float(my_aim[1]) if len(my_aim) > 1 else 0.0
                 pe = abs(aim[1] - my_pitch)
-                if thp < 200 or (ye < 0.20 and pe < 0.08):
+                if ye < 0.20 and pe < 0.08:
                     fire[0] = True
-            elif wpn[1] and wpn[1]["kind"] == "gun" and dt <= 40.0:
-                aim = self._aim_gun(me, mh, tpos)
+            elif wpn[1] and wpn[1]["kind"] == "gun" and dt <= 30.0:
+                aim = self._aim_point(me, mh, tpos)
                 act["aim"] = aim
                 my_aim = me.get("aim", [0, 0])
                 ye = abs((aim[0] - float(my_aim[0]) + math.pi) % (2 * math.pi) - math.pi)
                 my_pitch = float(my_aim[1]) if len(my_aim) > 1 else 0.0
                 pe = abs(aim[1] - my_pitch)
-                if thp < 200 or (ye < 0.20 and pe < 0.08):
-                    fire[1] = True
-
-            # Lightning: close range burst on low-HP targets
-            elif (wpn[0] and wpn[0]["kind"] == "lightning" and dt <= self.lightning_range and eng >= 18
-                  and thp < 200):
-                aim = self._aim_gun(me, mh, tpos)
-                act["aim"] = aim
-                my_aim = me.get("aim", [0, 0])
-                ye = abs((aim[0] - float(my_aim[0]) + math.pi) % (2 * math.pi) - math.pi)
-                if ye < 0.45:
-                    fire[0] = True
-            elif (wpn[1] and wpn[1]["kind"] == "lightning" and dt <= self.lightning_range and eng >= 18
-                  and thp < 200):
-                aim = self._aim_gun(me, mh, tpos)
-                act["aim"] = aim
-                my_aim = me.get("aim", [0, 0])
-                ye = abs((aim[0] - float(my_aim[0]) + math.pi) % (2 * math.pi) - math.pi)
-                if ye < 0.45:
+                if ye < 0.20 and pe < 0.08:
                     fire[1] = True
 
         if aim is None:
@@ -257,28 +231,11 @@ class Bot:
         mf.draw.label(f"HP:{hp:.0f}")
         return act
 
-    def _aim_gun(self, me, mh, tpos):
+    def _aim_point(self, me, mh, tpos):
         sx, sy, sz = me["pos"][0], me["pos"][1], me["pos"][2] + mh
         tx, ty, tz = tpos[0], tpos[1], tpos[2] + 4.5
         return [math.atan2(ty - sy, tx - sx),
                 clamp(math.atan2(tz - sz, max(math.hypot(tx - sx, ty - sy), 0.01)), -1.3, 1.3)]
-
-    def _aim_mortar(self, me, mh, tpos):
-        sx, sy, sz = me["pos"][0], me["pos"][1], me["pos"][2] + mh + 2.5
-        tx, ty, tz = tpos[0], tpos[1], tpos[2] + 4.5
-        vc = self.cfg.get("weapons", {}).get("mortar", {})
-        spd = max(float(vc.get("speed", 72.0)), 1.0)
-        g = float(vc.get("gravity", 22.0))
-        v2 = spd * spd
-        horiz = max(math.hypot(tx - sx, ty - sy) - 3.0, 0.5)
-        dz = tz - sz
-        tf = math.hypot(tx - sx, ty - sy) / (spd * 0.85)
-        pitch = 0.35
-        for _ in range(4):
-            disc = v2 * v2 - g * (g * horiz * horiz + 2.0 * dz * v2)
-            pitch = math.atan((v2 - math.sqrt(disc)) / (g * horiz)) if disc > 0 else 0.785
-            tf = horiz / (spd * max(math.cos(pitch), 0.25))
-        return [math.atan2(ty - sy, tx - sx), clamp(pitch, -1.2, 1.35)]
 
 
 mf.run(Bot)
