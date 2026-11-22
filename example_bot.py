@@ -103,7 +103,7 @@ class ArenaMap:
 
 
 class Bot:
-    name = "survival-tactician-v33"
+    name = "survival-tactician-v34"
 
     def __init__(self, hello):
         self.slot = int(hello.get("slot", 0))
@@ -116,15 +116,12 @@ class Bot:
         self.arena = ArenaMap(map_dir, mech_radius=mech_radius)
 
         self.upgrade_priority = [
-            "gun_rate", "gun_dmg", "damage", "armor", "reactive",
-            "hp", "health", "regen", "recovery",
-            "speed", "movement", "walk", "boost", "energy",
+            "gun_dmg", "gun_rate", "damage", "speed", "movement", "walk", "boost",
+            "armor", "reactive", "hp", "health", "regen", "recovery", "energy",
             "laser_charge", "mortar_cd",
         ]
 
         self.last_damage_tick = -9999
-        self.last_threat_yaw = None
-        self.last_threat_tick = -999
         self.strafe_dir = 1.0
         self.prev_enemy_vel = {}
         self.last_known_pos = {}
@@ -133,8 +130,6 @@ class Bot:
         self.locked_target_id = None
         self.locked_target_h = 4.5
         self.lock_lost_tick = -999
-        self._cover_cache = None
-        self._cover_cache_tick = -999
 
     def act(self, obs):
         try:
@@ -265,19 +260,6 @@ class Bot:
         pitch = math.atan2(dz, max(math.hypot(dx, dy), 0.01))
         return [yaw, clamp(pitch, -1.3, 1.3)]
 
-    def _nearest_cover_cached(self, x, y, tick):
-        if tick - self._cover_cache_tick > 20 or self._cover_cache is None:
-            best = None
-            best_d = 9999
-            for (cx, cy) in self.arena.cover_points:
-                d = math.hypot(cx - x, cy - y)
-                if d < best_d:
-                    best_d = d
-                    best = (cx, cy)
-            self._cover_cache = best
-            self._cover_cache_tick = tick
-        return self._cover_cache
-
     def _act(self, obs):
         tick = int(obs["tick"])
         me = obs["self"]
@@ -298,16 +280,14 @@ class Bot:
         if tick % 22 == 0:
             self.strafe_dir = -self.strafe_dir
 
-        # Upgrades: damage > armor > HP > regen > movement
+        # Upgrades: damage > gun rate > speed > armor > HP
         if obs.get("offer"):
             act["pick"] = self._choose_upgrade(obs["offer"])
 
         # Track incoming damage
         for ev in obs.get("events", []):
-            if ev.get("type") == "damaged" and ev.get("bearing") is not None:
+            if ev.get("type") == "damaged":
                 self.last_damage_tick = tick
-                self.last_threat_yaw = float(ev["bearing"])
-                self.last_threat_tick = tick
 
         # Categorize enemies & NPCs
         enemy_mechs = [m for m in obs.get("mechs", []) if m.get("kind") == "mech"]
@@ -355,10 +335,9 @@ class Bot:
                         break
 
         nearby_enemies = [m for m in enemy_mechs if math.dist(me["pos"], m["pos"]) < 200.0]
-        dmg_recent = (tick - self.last_damage_tick) < 60
-        hp_critical = hp_frac < 0.30
+        hp_critical = hp_frac < 0.05
 
-        # --- A. Movement: AGGRESSIVE - press forward, strafe ---
+        # --- A. Movement: BERSERKER - boost at enemies, strafe circles ---
         vx_des, vy_des = 0.0, 0.0
         z_cur = obs["zone"]
         nx, ny = z_cur["next_center"]
@@ -366,51 +345,42 @@ class Bot:
         dist_next = math.hypot(nx - x, ny - y)
         safe_rad = max(12.0, n_rad * 0.72)
 
-        # Zone: move toward center if outside or near edge
+        # Zone: move toward center if outside
         if not in_zone or dist_next > safe_rad:
             az = math.atan2(ny - y, nx - x)
             vx_des += math.cos(az) * 3.0
             vy_des += math.sin(az) * 3.0
 
-        # AGGRESSIVE: Move toward enemies, strafe to break aim
+        # BERSERKER: Charge nearest enemy
         if nearby_enemies:
             e = nearby_enemies[0]
             ex, ey = e["pos"][0], e["pos"][1]
             d = math.hypot(ex - x, ey - y)
             at = math.atan2(ey - y, ex - x)
-            e_hp_frac = float(e.get("hp", 1400.0)) / max(float(e.get("max_hp", 1400.0)), 1.0)
 
             if hp_critical:
-                # Run away when critical
+                # Only retreat when literally dying
                 ang_away = math.atan2(y - ey, x - ex)
-                vx_des += math.cos(ang_away) * 3.0
-                vy_des += math.sin(ang_away) * 3.0
-            elif d < 30.0:
-                # Point-blank: strafe perpendicular to enemy line
+                vx_des += math.cos(ang_away) * 3.5
+                vy_des += math.sin(ang_away) * 3.5
+            elif d < 35.0:
+                # Point-blank: tight circle strafe around enemy
                 s_ang = at + (math.pi * 0.5) * self.strafe_dir
-                vx_des += math.cos(s_ang) * 2.5
-                vy_des += math.sin(s_ang) * 2.5
+                vx_des += math.cos(s_ang) * 3.0
+                vy_des += math.sin(s_ang) * 3.0
             elif d < 80.0:
-                # Close range: strafe + close slowly
+                # Close range: strafe + inch forward
                 s_ang = at + (math.pi * 0.5) * self.strafe_dir
-                vx_des += math.cos(s_ang) * 1.5
-                vy_des += math.sin(s_ang) * 1.5
-                vx_des += math.cos(at) * 0.5
-                vy_des += math.sin(at) * 0.5
+                vx_des += math.cos(s_ang) * 2.0
+                vy_des += math.sin(s_ang) * 2.0
+                vx_des += math.cos(at) * 1.0
+                vy_des += math.sin(at) * 1.0
             else:
-                # Medium-long: close the distance
-                vx_des += math.cos(at) * 2.0
-                vy_des += math.sin(at) * 2.0
+                # Medium-long: boost directly at them
+                vx_des += math.cos(at) * 3.5
+                vy_des += math.sin(at) * 3.5
 
-            # Sound avoidance only when critical
-            if hp_critical:
-                for snd in obs.get("sounds", []):
-                    if snd.get("dist") == "near" and snd.get("kind") in ("gun", "laser", "mortar", "lightning", "explosion"):
-                        b = float(snd["bearing"])
-                        vx_des -= math.cos(b) * 2.0
-                        vy_des -= math.sin(b) * 2.0
-
-        # Zone orbit when safe
+        # Zone orbit when no enemies
         if not nearby_enemies and in_zone and dist_next <= safe_rad * 0.9:
             orbit = math.atan2(y - ny, x - nx) + 0.45
             tx_idle = nx + math.cos(orbit) * (safe_rad * 0.5)
@@ -419,28 +389,27 @@ class Bot:
             vx_des += math.cos(ai) * 0.8
             vy_des += math.sin(ai) * 0.8
 
-        # Farm NPCs aggressively - free cubes
-        if not enemy_mechs and npcs and hp_frac > 0.3:
+        # Farm NPCs only when zero enemies visible
+        if not enemy_mechs and npcs and hp_frac > 0.2:
             n = npcs[0]
-            nd = math.dist(n["pos"], me["pos"])
             ang = math.atan2(n["pos"][1] - y, n["pos"][0] - x)
-            vx_des += math.cos(ang) * 2.5
-            vy_des += math.sin(ang) * 2.5
+            vx_des += math.cos(ang) * 3.0
+            vy_des += math.sin(ang) * 3.0
 
-        # Cubes / crates / pickups when safe
-        if not enemy_mechs and hp_frac > 0.4:
+        # Cubes / pickups when safe
+        if not enemy_mechs and hp_frac > 0.3:
             if obs.get("cubes"):
                 c = min(obs["cubes"], key=lambda it: math.dist(it["pos"], me["pos"]))
                 if math.dist(c["pos"][:2], (x, y)) < 65.0:
                     ac = math.atan2(c["pos"][1] - y, c["pos"][0] - x)
-                    vx_des += math.cos(ac) * 1.6
-                    vy_des += math.sin(ac) * 1.6
+                    vx_des += math.cos(ac) * 2.0
+                    vy_des += math.sin(ac) * 2.0
             elif (weapons[0] is None or weapons[1] is None) and obs.get("pickups"):
                 p = min(obs["pickups"], key=lambda it: math.dist(it["pos"], me["pos"]))
                 if math.dist(p["pos"][:2], (x, y)) < 65.0:
                     ap = math.atan2(p["pos"][1] - y, p["pos"][0] - x)
-                    vx_des += math.cos(ap) * 1.4
-                    vy_des += math.sin(ap) * 1.4
+                    vx_des += math.cos(ap) * 1.8
+                    vy_des += math.sin(ap) * 1.8
 
         # Never stop moving
         if math.hypot(vx_des, vy_des) < 0.15:
@@ -469,18 +438,17 @@ class Bot:
             best_move_ang = des_ang
 
         act["move"] = [math.cos(best_move_ang) * des_mag, math.sin(best_move_ang) * des_mag]
-        act["boost"] = bool(energy > 25.0)
+        act["boost"] = bool(energy > 20.0)
         act["jump"] = bool(False)
 
-        # --- B & C. Combat: GUNS BLAZING - fire whenever aimed ---
+        # --- B & C. Combat: GUNS BLAZING - fire always when aimed ---
         muzzle_h = float(me.get("stats", {}).get("muzzle_height", self.cfg.get("mech", {}).get("muzzle_height", 7.0)))
         my_aim = me.get("aim") or [0.0, 0.0]
         has_pitch = len(my_aim) > 1
         my_yaw = float(my_aim[0])
         my_pitch = float(my_aim[1]) if has_pitch else 0.0
 
-        # Can fire: not critical HP, target in range
-        can_fire = hp_frac > 0.25
+        can_fire = hp_frac > 0.02  # Fire until literally dead
 
         target = None
         target_h = 4.5
@@ -533,18 +501,18 @@ class Bot:
             if target is None and not is_charging_laser:
                 self.locked_target_id = None
                 self.lock_lost_tick = -999
-                # Target selection: weakest first (third-party), then NPCs
+                # Target: weakest enemy first (third-party), then NPCs
                 if enemy_mechs and can_fire:
                     target = min(
                         enemy_mechs,
                         key=lambda m: float(m.get("hp", 1200.0)) + math.dist(m["pos"], me["pos"]) * 3.0,
                     )
                     target_h = 4.5
-                elif npcs and hp_frac > 0.3:
+                elif npcs and hp_frac > 0.2:
                     if math.dist(npcs[0]["pos"], me["pos"]) < 60.0:
                         target = npcs[0]
                         target_h = 1.75
-                elif obs.get("crates") and hp_frac > 0.5:
+                elif obs.get("crates") and hp_frac > 0.4:
                     cr = min(obs["crates"], key=lambda c: math.dist(c["pos"], me["pos"]))
                     if math.dist(cr["pos"], me["pos"]) < 35.0:
                         target = cr
@@ -651,8 +619,15 @@ class Bot:
             else:
                 self.locked_target_id = None
                 self.lock_lost_tick = -999
-                if tick - self.last_threat_tick < 40 and self.last_threat_yaw is not None:
-                    act["aim"] = [self.last_threat_yaw, 0.0]
+                if tick - self.last_damage_tick < 40 and obs.get("events"):
+                    # Aim at last damage source
+                    for ev in obs.get("events", []):
+                        if ev.get("type") == "damaged" and ev.get("bearing") is not None:
+                            act["aim"] = [float(ev["bearing"]), 0.0]
+                            break
+                    else:
+                        scan_yaw = (tick * 0.14) % (2.0 * math.pi) - math.pi
+                        act["aim"] = [scan_yaw, 0.0]
                 else:
                     scan_yaw = (tick * 0.14) % (2.0 * math.pi) - math.pi
                     act["aim"] = [scan_yaw, 0.0]
@@ -674,8 +649,7 @@ class Bot:
             mf.log(
                 f"t={tick} hp={me['hp']:.0f} alive={obs.get('alive')} "
                 f"in_zone={in_zone} zfrac={zone_frac:.2f} "
-                f"charging={is_charging_laser} locked={self.locked_target_id} enemy_d={nearest_d:.0f} "
-                f"dmg_recent={dmg_recent}"
+                f"charging={is_charging_laser} locked={self.locked_target_id} enemy_d={nearest_d:.0f}"
             )
 
         mf.draw.label(f"HP:{me['hp']:.0f} En:{energy:.0f} Alive:{obs.get('alive')}")
