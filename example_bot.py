@@ -105,28 +105,9 @@ class ArenaMap:
             score += weight
         return score
 
-    def los_blocked(self, x1, y1, x2, y2, step=2.0):
-        """True if any cell along the segment is blocked (building between two points)."""
-        if not self.blocked:
-            return False
-        dx = x2 - x1
-        dy = y2 - y1
-        dist = math.hypot(dx, dy)
-        if dist < step:
-            return False
-        steps = int(dist / step)
-        ux = dx / dist
-        uy = dy / dist
-        for i in range(1, steps):
-            px = x1 + ux * step * i
-            py = y1 + uy * step * i
-            if self.is_blocked(px, py):
-                return True
-        return False
-
 
 class Bot:
-    name = "survival-tactician-v30"
+    name = "survival-tactician-v32"
 
     def __init__(self, hello):
         self.slot = int(hello.get("slot", 0))
@@ -138,7 +119,6 @@ class Bot:
         map_dir = hello.get("map", {}).get("dir", "/arena")
         self.arena = ArenaMap(map_dir, mech_radius=mech_radius)
 
-        # Upgrade priority: armor > HP > regen > movement > damage
         self.upgrade_priority = [
             "armor", "reactive", "hp", "health", "regen", "recovery",
             "speed", "movement", "walk", "boost", "energy",
@@ -378,7 +358,7 @@ class Bot:
                         break
 
         # Tactical situation
-        nearby_enemies = [m for m in enemy_mechs if math.dist(me["pos"], m["pos"]) < 130.0]
+        nearby_enemies = [m for m in enemy_mechs if math.dist(me["pos"], m["pos"]) < 200.0]
         dmg_recent = (tick - self.last_damage_tick) < 60
         must_retreat = (hp_frac < 0.55 and len(nearby_enemies) > 0) or (
             len(nearby_enemies) >= 2 and hp_frac < 0.75
@@ -398,18 +378,32 @@ class Bot:
             vx_des += math.cos(az) * 3.0
             vy_des += math.sin(az) * 3.0
 
-        # When enemies nearby: move to cover, keep building between self and enemies
-        if nearby_enemies:
+        # Priority 1: Farm NPCs only when NO house enemies visible at all
+        if not enemy_mechs and npcs and hp_frac > 0.5:
+            n = npcs[0]
+            nd = math.dist(n["pos"], me["pos"])
+            if nd < 60.0:
+                nx2, ny2 = n["pos"][0], n["pos"][1]
+                ang = math.atan2(ny2 - y, nx2 - x)
+                vx_des += math.cos(ang) * 2.5
+                vy_des += math.sin(ang) * 2.5
+            else:
+                # Move toward NPC
+                nx2, ny2 = n["pos"][0], n["pos"][1]
+                ang = math.atan2(ny2 - y, nx2 - x)
+                vx_des += math.cos(ang) * 1.5
+                vy_des += math.sin(ang) * 1.5
+
+        # Priority 2: When house enemies nearby, seek cover
+        elif nearby_enemies:
             cover = self._nearest_cover_cached(x, y, tick)
             if cover:
                 cx, cy = cover
                 dc = math.hypot(cx - x, cy - y)
-                # Move to cover if not already there
                 if dc > 6.0:
                     vx_des += (cx - x) / max(dc, 0.1) * 2.5
                     vy_des += (cy - y) / max(dc, 0.1) * 2.5
                 else:
-                    # At cover: position building between us and nearest enemy
                     ex, ey = nearby_enemies[0]["pos"][0], nearby_enemies[0]["pos"][1]
                     dxc, dyc = cx - ex, cy - ey
                     dc2 = math.hypot(dxc, dyc)
@@ -422,25 +416,22 @@ class Bot:
                             vx_des += (dx2 / d2) * 1.5
                             vy_des += (dy2 / d2) * 1.5
                         else:
-                            # Strafe behind cover to break line of sight
                             s_ang = math.atan2(ey - y, ex - x) + (math.pi * 0.5) * self.strafe_dir
                             vx_des += math.cos(s_ang) * 1.0
                             vy_des += math.sin(s_ang) * 1.0
             else:
-                # No cover: run directly away from nearest enemy
                 ex, ey = nearby_enemies[0]["pos"][0], nearby_enemies[0]["pos"][1]
                 at = math.atan2(y - ey, x - ex)
                 vx_des += math.cos(at) * 3.0
                 vy_des += math.sin(at) * 3.0
 
-            # Sound-based avoidance when retreating
             for snd in obs.get("sounds", []):
                 if snd.get("dist") == "near" and snd.get("kind") in ("gun", "laser", "mortar", "lightning", "explosion"):
                     b = float(snd["bearing"])
                     vx_des -= math.cos(b) * 1.5
                     vy_des -= math.sin(b) * 1.5
 
-        # Zone orbit when safe (keep moving without exposing)
+        # Zone orbit when safe
         if not nearby_enemies and in_zone and dist_next <= safe_rad * 0.9:
             orbit = math.atan2(y - ny, x - nx) + 0.45
             tx_idle = nx + math.cos(orbit) * (safe_rad * 0.5)
@@ -449,8 +440,8 @@ class Bot:
             vx_des += math.cos(ai) * 0.8
             vy_des += math.sin(ai) * 0.8
 
-        # NPCs / cubes / crates when no enemies and safe
-        if not nearby_enemies and hp_frac > 0.6:
+        # Cubes / crates / drops when no enemies visible and safe
+        if not enemy_mechs and hp_frac > 0.6:
             if obs.get("cubes"):
                 c = min(obs["cubes"], key=lambda it: math.dist(it["pos"], me["pos"]))
                 if math.dist(c["pos"][:2], (x, y)) < 65.0:
@@ -470,7 +461,7 @@ class Bot:
                     vx_des += math.cos(acr) * 1.1
                     vy_des += math.sin(acr) * 1.1
 
-        if not nearby_enemies and hp_frac > 0.65:
+        if not enemy_mechs and hp_frac > 0.65:
             for dr in obs.get("drops", []):
                 if (
                     math.dist(dr["pos"][:2], (x, y)) < 45.0
@@ -512,32 +503,19 @@ class Bot:
         act["boost"] = bool((must_retreat or not in_zone) and energy > 22.0 and len(nearby_enemies) == 0)
         act["jump"] = bool(False)
 
-        # --- B & C. Combat: fire ONLY when behind cover ---
+        # --- B & C. Combat: fire ONLY when NOT taking damage ---
         muzzle_h = float(me.get("stats", {}).get("muzzle_height", self.cfg.get("mech", {}).get("muzzle_height", 7.0)))
         my_aim = me.get("aim") or [0.0, 0.0]
         has_pitch = len(my_aim) > 1
         my_yaw = float(my_aim[0])
         my_pitch = float(my_aim[1]) if has_pitch else 0.0
 
-        # HARD RULE: never fire in the open. Only fire if behind cover AND not recently damaged
-        cover_pos = self._nearest_cover_cached(x, y, tick)
-        behind_cover = False
-        if cover_pos:
-            ccx, ccy = cover_pos
-            cd = math.hypot(ccx - x, ccy - y)
-            if cd <= 8.0:
-                # Check if building is between us and nearest enemy
-                if nearby_enemies:
-                    ex, ey = nearby_enemies[0]["pos"][0], nearby_enemies[0]["pos"][1]
-                    behind_cover = self.arena.los_blocked(x, y, ex, ey)
-                else:
-                    behind_cover = True
-
-        can_fire_safely = (
-            behind_cover
-            and not dmg_recent
-            and len(nearby_enemies) <= 1
-            and hp_frac > 0.40
+        # Can fire only if: not recently damaged, HP decent, not retreating
+        can_fire = (
+            not dmg_recent
+            and not must_retreat
+            and hp_frac > 0.45
+            and len(nearby_enemies) <= 2
         )
 
         target = None
@@ -578,7 +556,7 @@ class Bot:
                         self.lock_lost_tick = -999
                     else:
                         fire = [False, False]
-                        if can_fire_safely:
+                        if can_fire:
                             for idx, w in enumerate(weapons):
                                 if w and w["kind"] == "laser" and float(w.get("charge", 0.0)) > 0.0:
                                     fire[idx] = True
@@ -591,17 +569,17 @@ class Bot:
             if target is None and not is_charging_laser:
                 self.locked_target_id = None
                 self.lock_lost_tick = -999
-                # Target selection: prioritize weak isolated enemies, NPCs, crates
-                if enemy_mechs:
+                # Target selection: NPCs first (free cubes), then weak enemies
+                if npcs and hp_frac > 0.5 and obs.get("alive", 16) > 6:
+                    if math.dist(npcs[0]["pos"], me["pos"]) < 60.0:
+                        target = npcs[0]
+                        target_h = 1.75
+                elif enemy_mechs and can_fire:
                     target = min(
                         enemy_mechs,
                         key=lambda m: float(m.get("hp", 1200.0)) + math.dist(m["pos"], me["pos"]) * 3.0,
                     )
                     target_h = 4.5
-                elif npcs and hp_frac > 0.72 and obs.get("alive", 16) > 4:
-                    if math.dist(npcs[0]["pos"], me["pos"]) < 55.0:
-                        target = npcs[0]
-                        target_h = 1.75
                 elif obs.get("crates") and hp_frac > 0.68:
                     cr = min(obs["crates"], key=lambda c: math.dist(c["pos"], me["pos"]))
                     if math.dist(cr["pos"], me["pos"]) < 35.0:
@@ -611,7 +589,7 @@ class Bot:
             fire = [False, False]
             need_reload = False
 
-            if target is not None and can_fire_safely:
+            if target is not None and can_fire:
                 if "id" in target:
                     self.locked_target_id = int(target["id"])
                     self.locked_target_h = target_h
@@ -733,7 +711,7 @@ class Bot:
                 f"t={tick} hp={me['hp']:.0f} alive={obs.get('alive')} "
                 f"in_zone={in_zone} zfrac={zone_frac:.2f} "
                 f"charging={is_charging_laser} locked={self.locked_target_id} enemy_d={nearest_d:.0f} "
-                f"dmg_recent={dmg_recent} behind_cover={behind_cover}"
+                f"dmg_recent={dmg_recent} can_fire={can_fire}"
             )
 
         mf.draw.label(f"HP:{me['hp']:.0f} En:{energy:.0f} Alive:{obs.get('alive')}")
