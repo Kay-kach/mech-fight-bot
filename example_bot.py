@@ -69,7 +69,7 @@ class ArenaMap:
 
 
 class Bot:
-    name = "survival-tactician-v18"
+    name = "survival-tactician-v19"
 
     def __init__(self, hello):
         self.cfg = hello.get("config", {})
@@ -123,7 +123,7 @@ class Bot:
             vel[mid] = sv
             self.prev_vel[mid] = sv
 
-        # Loot
+        # Loot pickup (simple: take any new weapon into empty slot)
         for p in obs.get("pickups", []):
             if math.dist(p["pos"][:2], (x, y)) < self.reach and abs(p["pos"][2] - z) < 4.0:
                 pk = p["kind"]
@@ -143,12 +143,12 @@ class Bot:
             vx += math.cos(az) * 2.5
             vy += math.sin(az) * 2.5
 
-        # Dodge projectiles
+        # Dodge incoming projectiles (simple perpendicular dodge)
         for pj in obs.get("projectiles", []):
             px, py = pj["pos"][0], pj["pos"][1]
             pvx, pvy = pj.get("vel", [0, 0, 0])[0], pj.get("vel", [0, 0, 0])[1]
             d = math.hypot(px - x, py - y)
-            if 2.0 < d < 30.0:
+            if 2.0 < d < 25.0:
                 tx, ty = x - px, y - py
                 td = math.hypot(tx, ty)
                 if td > 0.01:
@@ -157,11 +157,9 @@ class Bot:
                     vd = math.hypot(pvx, pvy)
                     if vd > 0.01:
                         align = (pvx / vd) * tx + (pvy / vd) * ty
-                        if align > 0.15:
+                        if align > 0.1:
                             px2, py2 = -ty, tx
-                            if self.arena.blocked_at(x + px2, y + py2):
-                                px2, py2 = -px2, -py2
-                            sf = max(0.0, (30.0 - d) / 30.0)
+                            sf = max(0.0, (25.0 - d) / 25.0)
                             vx += px2 * 2.5 * sf
                             vy += py2 * 2.5 * sf
 
@@ -171,42 +169,28 @@ class Bot:
             d = math.hypot(ex - x, ey - y)
             at = math.atan2(ey - y, ex - x)
 
-            # Pure turtle: never approach at long range.
-            # Only close to point-blank (< 15m). Otherwise retreat to cover.
-            if d < 15.0:
-                # Point-blank: strafe to be harder to hit (enemy has perfect aim,
-                # but fast strafe breaks their aim slew at close range)
-                sa = at + (math.pi * 0.5) * self.strafe_dir
-                vx += math.cos(sa) * 1.5
-                vy += math.sin(sa) * 1.5
+            # Rush to point-blank (< 30m), then strafe
+            if d > 30.0:
+                vx += math.cos(at) * 2.5
+                vy += math.sin(at) * 2.5
             else:
-                # Retreat: move away from enemy, seek cover
-                aa = math.atan2(y - ey, x - ex)
-                vx += math.cos(aa) * 2.2
-                vy += math.sin(aa) * 2.2
-                # Seek cover: move toward a blocked cell
-                best_cx, best_cy, best_s = x, y, -999.0
-                for k in range(8):
-                    ca = (t * 0.05 + k) * (math.pi / 4.0)
-                    cx, cy = x + math.cos(ca) * 20.0, y + math.sin(ca) * 20.0
-                    if self.arena.blocked_at(cx, cy):
-                        # Bonus if cover breaks LOS to enemy
-                        mx, my = (x + cx) / 2, (y + cy) / 2
-                        score = 1.0
-                        if self.arena.blocked_at(mx, my):
-                            score += 3.0
-                        # Closer cover is better
-                        score -= math.hypot(cx - x, cy - y) * 0.05
-                        if score > best_s:
-                            best_s = score
-                            best_cx, best_cy = cx, cy
-                if best_s > 0:
-                    ac = math.atan2(best_cy - y, best_cx - x)
-                    vx += math.cos(ac) * 1.8
-                    vy += math.sin(ac) * 1.8
+                sa = at + (math.pi * 0.5) * self.strafe_dir
+                vx += math.cos(sa) * 1.8
+                vy += math.sin(sa) * 1.8
         else:
-            vx += math.cos(t * 0.1) * 0.4
-            vy += math.sin(t * 0.1) * 0.4
+            # No enemies: farm NPCs or wander
+            if npcs:
+                n = npcs[0]
+                nd = math.dist(n["pos"], me["pos"])
+                if nd < 50.0:
+                    vx += math.cos(math.atan2(n["pos"][1] - y, n["pos"][0] - x)) * 1.8
+                    vy += math.sin(math.atan2(n["pos"][1] - y, n["pos"][0] - x)) * 1.8
+                else:
+                    vx += math.cos(t * 0.1) * 0.5
+                    vy += math.sin(t * 0.1) * 0.5
+            else:
+                vx += math.cos(t * 0.1) * 0.5
+                vy += math.sin(t * 0.1) * 0.5
 
         if math.hypot(vx, vy) < 0.05:
             vx = math.cos(t * 0.13) * 0.4
@@ -228,6 +212,7 @@ class Bot:
         act["boost"] = bool(enemies and eng > 25.0)
         act["jump"] = bool(False)
 
+        # Fire only at point-blank range where spread doesn't matter
         fire = [False, False]
         aim = None
         if enemies:
@@ -238,8 +223,7 @@ class Bot:
             dt = math.dist(tpos, me["pos"])
             thp = float(e.get("hp", 1400.0))
 
-            # Only fire at point-blank range
-            if dt < 20.0:
+            if dt < 30.0:
                 best_slot, best_u = None, -1.0
                 for i, w in enumerate(wpn):
                     if w is None:
@@ -251,8 +235,6 @@ class Bot:
                         u = 9.0 if thp < 150 else 1.0
                     elif wk == "laser":
                         u = 2.0 if dt <= 280 else -1.0
-                    elif wk == "mortar":
-                        u = -1.0  # mortar useless at point-blank
                     else:
                         continue
                     if u > best_u:
